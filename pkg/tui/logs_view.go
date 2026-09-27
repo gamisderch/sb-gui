@@ -75,13 +75,13 @@ func (m *Model) RenderLogsView() string {
 		tabNum := fmt.Sprintf("[%d] %s", i+1, name)
 		if LogTab(i) == m.logActiveTab {
 			tabBtns = append(tabBtns, lipgloss.NewStyle().
-				Foreground(ColorWhite).
-				Background(ColorSelection).
+				Foreground(ColorTextNormal).
+				Background(ColorLogTabActive).
 				Bold(true).
 				Render(" "+tabNum+" "))
 		} else {
 			tabBtns = append(tabBtns, lipgloss.NewStyle().
-				Foreground(ColorMuted).
+				Foreground(ColorLogTabInactive).
 				Background(bg).
 				Render(" "+tabNum+" "))
 		}
@@ -108,7 +108,7 @@ func (m *Model) RenderLogsView() string {
 	subLeft := fmt.Sprintf(" %s ", logTabSources[m.logActiveTab])
 	subRight := fmt.Sprintf(" Lines: %d │ Follow: %s [f] │ [Tab] Next Tab ", totalLogs, followStr)
 	subLeftStyled := lipgloss.NewStyle().Foreground(ColorSecondary).Background(bg).Bold(true).Render(subLeft)
-	subRightStyled := lipgloss.NewStyle().Foreground(ColorMuted).Background(bg).Render(subRight)
+	subRightStyled := lipgloss.NewStyle().Foreground(ColorLogMeta).Background(bg).Render(subRight)
 	subW := lipgloss.Width(subLeft) + lipgloss.Width(subRight)
 	dashSlack := width - subW - 2
 	if dashSlack < 0 {
@@ -265,25 +265,25 @@ func (m *Model) formatLogLine(raw string, maxWidth int) string {
 
 	// Determine log level color
 	if strings.Contains(lower, "error") || strings.Contains(lower, "failed") || strings.Contains(lower, "failure") || strings.Contains(lower, "fatal") {
-		return lipgloss.NewStyle().Foreground(ColorDanger).Background(bg).Render(clean)
+		return lipgloss.NewStyle().Foreground(ColorLogError).Background(bg).Render(clean)
 	}
 	if strings.Contains(lower, "warn") || strings.Contains(lower, "warning") {
-		return lipgloss.NewStyle().Foreground(ColorWarning).Background(bg).Render(clean)
+		return lipgloss.NewStyle().Foreground(ColorLogWarn).Background(bg).Render(clean)
 	}
 	if strings.Contains(clean, "[INFO]") || strings.Contains(lower, "connected") || strings.Contains(lower, "active") {
-		return lipgloss.NewStyle().Foreground(ColorSuccess).Background(bg).Render(clean)
+		return lipgloss.NewStyle().Foreground(ColorLogInfo).Background(bg).Render(clean)
 	}
 	if strings.Contains(clean, "inbound/tun") {
-		return lipgloss.NewStyle().Foreground(ColorPrimary).Background(bg).Render(clean)
+		return lipgloss.NewStyle().Foreground(ColorLogInbound).Background(bg).Render(clean)
 	}
 	if strings.Contains(clean, "outbound/direct") {
-		return lipgloss.NewStyle().Foreground(ColorSecondary).Background(bg).Render(clean)
+		return lipgloss.NewStyle().Foreground(ColorLogOutbound).Background(bg).Render(clean)
 	}
 	if strings.Contains(clean, "outbound/socks") || strings.Contains(clean, "proxy") {
-		return lipgloss.NewStyle().Foreground(ColorSecondary).Background(bg).Render(clean)
+		return lipgloss.NewStyle().Foreground(ColorLogOutbound).Background(bg).Render(clean)
 	}
 
-	return lipgloss.NewStyle().Foreground(ColorWhite).Background(bg).Render(clean)
+	return lipgloss.NewStyle().Foreground(ColorTextNormal).Background(bg).Render(clean)
 }
 
 // handleLogsKeys handles keyboard input in ViewLogs

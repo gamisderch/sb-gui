@@ -460,8 +460,10 @@ func (m *Model) renderDashboardPanel(width, height int) string {
 	if sparkWidth < 6 {
 		sparkWidth = 6
 	}
-	rxGraph := Sparkline(m.rxHistory, sparkWidth, StyleSuccess)
-	txGraph := Sparkline(m.txHistory, sparkWidth, StyleSecondary)
+	rxStyle := lipgloss.NewStyle().Foreground(ColorGraphRx).Background(ColorBg)
+	txStyle := lipgloss.NewStyle().Foreground(ColorGraphTx).Background(ColorBg)
+	rxGraph := Sparkline(m.rxHistory, sparkWidth, rxStyle)
+	txGraph := Sparkline(m.txHistory, sparkWidth, txStyle)
 
 	downLabel := lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render("  Down ")
 	downSpeed := StyleSuccess.Copy().Background(ColorBg).Bold(true).Render(fmt.Sprintf("%9s", m.currentRxRate))

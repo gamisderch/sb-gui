@@ -98,12 +98,14 @@ type Model struct {
 	muxCursor int
 
 	// Theme Studio state
-	themeCursor       int  // Index in getThemeElements()
-	themeSliderActive bool // true = adjusting RGB sliders, false = browsing elements
+	themeSection      int  // 0 = Text & Gradient, 1 = Interface, 2 = Logs
+	themeCursor       int  // Index within active section's elements
+	themeSliderActive bool // true = adjusting RGB sliders/intensity, false = browsing elements
 	themeRGBIndex     int  // 0 = R, 1 = G, 2 = B
 	themeR            int  // Current Red (0..255)
 	themeG            int  // Current Green (0..255)
 	themeB            int  // Current Blue (0..255)
+	themeIntensity    int  // Current Gradient Intensity (1..10)
 
 	// Geo Rules & Sync state
 	geoInProfileView bool // false = Level 0 (Profile Selection), true = Level 1 (Direct/Proxy/Block menu)
@@ -2411,10 +2413,59 @@ func (m *Model) handleGeoActionViewKeys(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) syncThemeState() {
+	if m.state.ThemeColors == nil {
+		m.state.ThemeColors = make(map[string]string)
+	}
+	m.state.ThemeColors = GetCurrentThemeMap()
+}
+
 func (m *Model) handleThemeKeys(key string) (tea.Model, tea.Cmd) {
-	elements := getThemeElements()
+	elements := m.getActiveThemeElements()
+	if m.themeCursor < 0 || m.themeCursor >= len(elements) {
+		m.themeCursor = 0
+	}
+	curElem := elements[m.themeCursor]
 
 	if m.themeSliderActive {
+		if curElem.IsIntensity {
+			switch key {
+			case "left", "h":
+				if m.themeIntensity > 1 {
+					m.themeIntensity--
+				}
+				curElem.SetIntVal(m.themeIntensity)
+				m.syncThemeState()
+			case "right", "l":
+				if m.themeIntensity < 10 {
+					m.themeIntensity++
+				}
+				curElem.SetIntVal(m.themeIntensity)
+				m.syncThemeState()
+			case "shift+left", "H", "[":
+				m.themeIntensity = clamp(m.themeIntensity-3, 1, 10)
+				curElem.SetIntVal(m.themeIntensity)
+				m.syncThemeState()
+			case "shift+right", "L", "]":
+				m.themeIntensity = clamp(m.themeIntensity+3, 1, 10)
+				curElem.SetIntVal(m.themeIntensity)
+				m.syncThemeState()
+			case "r":
+				m.themeIntensity = 5
+				curElem.SetIntVal(5)
+				m.syncThemeState()
+				m.statusMessage = "Gradient intensity reset to default (5)."
+				m.statusIsError = false
+			case "enter", "esc":
+				m.themeSliderActive = false
+				m.syncThemeState()
+				_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+				m.statusMessage = fmt.Sprintf("Gradient intensity set to %d/10.", m.themeIntensity)
+				m.statusIsError = false
+			}
+			return m, nil
+		}
+
 		switch key {
 		case "up", "k":
 			if m.themeRGBIndex > 0 {
@@ -2438,25 +2489,18 @@ func (m *Model) handleThemeKeys(key string) (tea.Model, tea.Cmd) {
 			m.adjustActiveRGB(10)
 		case "enter", "esc":
 			m.themeSliderActive = false
-			if m.state.ThemeColors == nil {
-				m.state.ThemeColors = make(map[string]string)
-			}
-			m.state.ThemeColors = GetCurrentThemeMap()
+			m.syncThemeState()
 			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 			m.statusMessage = "Color updated."
 			m.statusIsError = false
-		case "r", "R":
-			if m.themeCursor >= 0 && m.themeCursor < len(elements) {
-				elem := elements[m.themeCursor]
-				if def, ok := DefaultThemeColors[elem.ID]; ok {
-					elem.SetColor(def)
-					m.themeR, m.themeG, m.themeB = hexToRGB(def)
-					if m.state.ThemeColors == nil {
-						m.state.ThemeColors = make(map[string]string)
-					}
-					m.state.ThemeColors = GetCurrentThemeMap()
-					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
-				}
+		case "r":
+			if def, ok := DefaultThemeColors[curElem.ID]; ok {
+				curElem.SetColor(def)
+				m.themeR, m.themeG, m.themeB = hexToRGB(def)
+				m.syncThemeState()
+				_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+				m.statusMessage = fmt.Sprintf("Reset [%s] to default (%s)", curElem.Name, def)
+				m.statusIsError = false
 			}
 		}
 		return m, nil
@@ -2464,6 +2508,28 @@ func (m *Model) handleThemeKeys(key string) (tea.Model, tea.Cmd) {
 
 	// Browsing theme elements
 	switch key {
+	case "tab":
+		m.themeSection = (m.themeSection + 1) % 3
+		m.themeCursor = 0
+	case "shift+tab":
+		m.themeSection = (m.themeSection + 2) % 3
+		m.themeCursor = 0
+	case "1":
+		m.themeSection = 0
+		m.themeCursor = 0
+	case "2":
+		m.themeSection = 1
+		m.themeCursor = 0
+	case "3":
+		m.themeSection = 2
+		m.themeCursor = 0
+	case "left":
+		m.themeSection = (m.themeSection + 2) % 3
+		m.themeCursor = 0
+	case "right":
+		m.themeSection = (m.themeSection + 1) % 3
+		m.themeCursor = 0
+
 	case "up", "k":
 		if m.themeCursor > 0 {
 			m.themeCursor--
@@ -2476,33 +2542,62 @@ func (m *Model) handleThemeKeys(key string) (tea.Model, tea.Cmd) {
 		} else {
 			m.themeCursor = 0
 		}
+
 	case "enter", " ":
 		m.themeSliderActive = true
-		m.themeRGBIndex = 0
-		if m.themeCursor >= 0 && m.themeCursor < len(elements) {
-			curHex := elements[m.themeCursor].GetColor()
+		if curElem.IsIntensity {
+			m.themeIntensity = curElem.GetIntVal()
+		} else {
+			m.themeRGBIndex = 0
+			curHex := curElem.GetColor()
 			m.themeR, m.themeG, m.themeB = hexToRGB(curHex)
 		}
-	case "r", "R":
+
+	case "r":
+		if curElem.IsIntensity {
+			curElem.SetIntVal(5)
+			m.themeIntensity = 5
+			m.syncThemeState()
+			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+			m.statusMessage = "Gradient intensity reset to default (5)."
+			m.statusIsError = false
+		} else if def, ok := DefaultThemeColors[curElem.ID]; ok {
+			curElem.SetColor(def)
+			m.syncThemeState()
+			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+			m.statusMessage = fmt.Sprintf("Reset [%s] to default (%s)", curElem.Name, def)
+			m.statusIsError = false
+		}
+
+	case "R", "ctrl+r":
 		ApplyThemeColors(DefaultThemeColors)
-		m.state.ThemeColors = GetCurrentThemeMap()
+		ThemeGradIntensity = 5
+		m.themeIntensity = 5
+		m.syncThemeState()
 		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
-		m.statusMessage = "Theme reset to default btop palette."
+		m.statusMessage = "All theme colors reset to factory defaults."
 		m.statusIsError = false
+
 	case "s", "S":
-		m.state.ThemeColors = GetCurrentThemeMap()
+		m.syncThemeState()
 		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 		m.statusMessage = "Theme saved to ~/.config/sb-cli/config.json."
 		m.statusIsError = false
+
 	case "esc", "q", "Q":
 		m.view = ViewSettings
+		m.settingsCursor = 0
 	}
 	return m, nil
 }
 
 func (m *Model) adjustActiveRGB(delta int) {
-	elements := getThemeElements()
+	elements := m.getActiveThemeElements()
 	if m.themeCursor < 0 || m.themeCursor >= len(elements) {
+		return
+	}
+	elem := elements[m.themeCursor]
+	if elem.IsIntensity {
 		return
 	}
 
@@ -2516,11 +2611,8 @@ func (m *Model) adjustActiveRGB(delta int) {
 	}
 
 	newHex := rgbToHex(m.themeR, m.themeG, m.themeB)
-	elements[m.themeCursor].SetColor(newHex)
-	if m.state.ThemeColors == nil {
-		m.state.ThemeColors = make(map[string]string)
-	}
-	m.state.ThemeColors = GetCurrentThemeMap()
+	elem.SetColor(newHex)
+	m.syncThemeState()
 }
 
 func (m *Model) View() string {
@@ -2841,18 +2933,34 @@ func (m *Model) renderFooter() string {
 
 	case ViewTheme:
 		if m.themeSliderActive {
-			buttons = strings.Join([]string{
-				RenderFooterButton("←/→", "±1"),
-				RenderFooterButton("H/L", "±10"),
-				RenderFooterButton("↑/↓", "R/G/B"),
-				RenderFooterButton("r", "reset color"),
-				RenderFooterButton("↵/esc", "done"),
-			}, "")
+			elements := m.getActiveThemeElements()
+			isIntensity := false
+			if m.themeCursor >= 0 && m.themeCursor < len(elements) {
+				isIntensity = elements[m.themeCursor].IsIntensity
+			}
+			if isIntensity {
+				buttons = strings.Join([]string{
+					RenderFooterButton("←/→", "±1"),
+					RenderFooterButton("H/L", "±3"),
+					RenderFooterButton("r", "reset default"),
+					RenderFooterButton("↵/esc", "done"),
+				}, "")
+			} else {
+				buttons = strings.Join([]string{
+					RenderFooterButton("←/→", "±1"),
+					RenderFooterButton("H/L", "±10"),
+					RenderFooterButton("↑/↓", "R/G/B"),
+					RenderFooterButton("r", "reset color"),
+					RenderFooterButton("↵/esc", "done"),
+				}, "")
+			}
 		} else {
 			buttons = strings.Join([]string{
-				RenderFooterButton("↑/↓", "select element"),
-				RenderFooterButton("↵", "edit RGB"),
-				RenderFooterButton("r", "reset default"),
+				RenderFooterButton("tab/1..3", "section"),
+				RenderFooterButton("↑/↓", "select item"),
+				RenderFooterButton("↵", "edit value"),
+				RenderFooterButton("r", "reset item"),
+				RenderFooterButton("R", "reset all"),
 				RenderFooterButton("s", "save"),
 				RenderFooterButton("q", "back"),
 			}, "")

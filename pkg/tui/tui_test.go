@@ -1519,5 +1519,150 @@ func TestIPTypePreferenceCycling(t *testing.T) {
 	}
 }
 
+func TestThemeStudioReworkSectionsAndControls(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewTheme
+	m.themeSection = 0
+	m.themeCursor = 0
+	m.themeSliderActive = false
+
+	// 1. Verify 3 sections cycling via Tab and 1..3
+	if m.themeSection != 0 {
+		t.Fatalf("expected initial section 0, got %d", m.themeSection)
+	}
+	_, _ = m.handleThemeKeys("tab")
+	if m.themeSection != 1 {
+		t.Fatalf("expected section 1 after Tab, got %d", m.themeSection)
+	}
+	_, _ = m.handleThemeKeys("tab")
+	if m.themeSection != 2 {
+		t.Fatalf("expected section 2 after Tab, got %d", m.themeSection)
+	}
+	_, _ = m.handleThemeKeys("tab")
+	if m.themeSection != 0 {
+		t.Fatalf("expected section 0 after 3rd Tab, got %d", m.themeSection)
+	}
+	_, _ = m.handleThemeKeys("2")
+	if m.themeSection != 1 {
+		t.Fatalf("expected section 1 after '2', got %d", m.themeSection)
+	}
+	_, _ = m.handleThemeKeys("3")
+	if m.themeSection != 2 {
+		t.Fatalf("expected section 2 after '3', got %d", m.themeSection)
+	}
+	_, _ = m.handleThemeKeys("1")
+	if m.themeSection != 0 {
+		t.Fatalf("expected section 0 after '1', got %d", m.themeSection)
+	}
+
+	// 2. Section 0: Edit Gradient Base Color (index 7)
+	m.themeCursor = 7
+	elems := m.getActiveThemeElements()
+	if elems[m.themeCursor].ID != "grad_color" {
+		t.Fatalf("expected index 7 to be grad_color, got %s", elems[m.themeCursor].ID)
+	}
+	_, _ = m.handleThemeKeys("enter")
+	if !m.themeSliderActive {
+		t.Fatalf("expected slider to be active")
+	}
+	// Adjust Red slider (+10)
+	initR := m.themeR
+	m.handleThemeKeys("]")
+	if m.themeR != initR+10 {
+		t.Fatalf("expected themeR %d, got %d", initR+10, m.themeR)
+	}
+	expectedGradHex := rgbToHex(m.themeR, m.themeG, m.themeB)
+	if string(ColorGradBase) != expectedGradHex {
+		t.Fatalf("expected ColorGradBase %s, got %s", expectedGradHex, string(ColorGradBase))
+	}
+	// Exit slider mode
+	_, _ = m.handleThemeKeys("enter")
+	if m.themeSliderActive {
+		t.Fatalf("expected slider to be inactive after Enter")
+	}
+
+	// 3. Section 0: Edit Gradient Intensity (index 8)
+	m.themeCursor = 8
+	elems = m.getActiveThemeElements()
+	if elems[m.themeCursor].ID != "grad_intensity" || !elems[m.themeCursor].IsIntensity {
+		t.Fatalf("expected index 8 to be grad_intensity, got %v", elems[m.themeCursor])
+	}
+	_, _ = m.handleThemeKeys("enter")
+	if !m.themeSliderActive {
+		t.Fatalf("expected slider active for intensity")
+	}
+	initInt := ThemeGradIntensity
+	m.handleThemeKeys("right")
+	if ThemeGradIntensity != initInt+1 {
+		t.Fatalf("expected intensity %d, got %d", initInt+1, ThemeGradIntensity)
+	}
+	m.handleThemeKeys("r")
+	if ThemeGradIntensity != 5 {
+		t.Fatalf("expected intensity reset to 5, got %d", ThemeGradIntensity)
+	}
+	_, _ = m.handleThemeKeys("enter")
+
+	// 4. Section 1 (Interface Elements): Edit border_active (index 2)
+	m.themeSection = 1
+	m.themeCursor = 2
+	elems = m.getActiveThemeElements()
+	if elems[m.themeCursor].ID != "border_active" {
+		t.Fatalf("expected border_active at index 2, got %s", elems[m.themeCursor].ID)
+	}
+	_, _ = m.handleThemeKeys("enter")
+	m.handleThemeKeys("right") // +1
+	expectedBorderHex := rgbToHex(m.themeR, m.themeG, m.themeB)
+	if string(ColorBorderActive) != expectedBorderHex {
+		t.Fatalf("expected ColorBorderActive %s, got %s", expectedBorderHex, string(ColorBorderActive))
+	}
+	_, _ = m.handleThemeKeys("esc")
+
+	// 5. Section 2 (Logs Viewer): Edit log_error (index 4)
+	m.themeSection = 2
+	m.themeCursor = 4
+	elems = m.getActiveThemeElements()
+	if elems[m.themeCursor].ID != "log_error" {
+		t.Fatalf("expected log_error at index 4, got %s", elems[m.themeCursor].ID)
+	}
+	_, _ = m.handleThemeKeys("enter")
+	m.handleThemeKeys("left") // -1
+	expectedLogErrHex := rgbToHex(m.themeR, m.themeG, m.themeB)
+	if string(ColorLogError) != expectedLogErrHex {
+		t.Fatalf("expected ColorLogError %s, got %s", expectedLogErrHex, string(ColorLogError))
+	}
+	_, _ = m.handleThemeKeys("esc")
+
+	// 6. Reset item to default with 'r'
+	m.handleThemeKeys("r")
+	if string(ColorLogError) != DefaultThemeColors["log_error"] {
+		t.Fatalf("expected ColorLogError reset to %s, got %s", DefaultThemeColors["log_error"], string(ColorLogError))
+	}
+
+	// 7. Factory Reset ALL with 'R'
+	m.handleThemeKeys("R")
+	if string(ColorGradBase) != DefaultThemeColors["grad_color"] {
+		t.Fatalf("expected ColorGradBase factory reset to %s, got %s", DefaultThemeColors["grad_color"], string(ColorGradBase))
+	}
+	if ThemeGradIntensity != 5 {
+		t.Fatalf("expected ThemeGradIntensity 5 after factory reset, got %d", ThemeGradIntensity)
+	}
+	if string(ColorBorderActive) != DefaultThemeColors["border_active"] {
+		t.Fatalf("expected ColorBorderActive reset to %s, got %s", DefaultThemeColors["border_active"], string(ColorBorderActive))
+	}
+
+	// 8. Render view in all 3 sections to ensure no panic and live previews are present
+	for sec := 0; sec < 3; sec++ {
+		m.themeSection = sec
+		m.themeCursor = 0
+		rendered := m.RenderThemeView()
+		if !strings.Contains(rendered, "Theme Studio") {
+			t.Fatalf("expected section %d to contain 'Theme Studio'", sec)
+		}
+		if !strings.Contains(rendered, "Live Preview") && !strings.Contains(rendered, "Current Palette Preview") {
+			t.Fatalf("expected section %d to contain preview section", sec)
+		}
+	}
+}
+
 
 
