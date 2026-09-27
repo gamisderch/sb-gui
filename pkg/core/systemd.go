@@ -39,22 +39,29 @@ func InstallSystemdService() (string, error) {
 		return "", err
 	}
 
+	workDir := filepath.Dir(filepath.Dir(execPath))
+	if _, err := os.Stat(filepath.Join(workDir, "bin")); err != nil {
+		workDir = filepath.Dir(execPath)
+	}
+
 	content := fmt.Sprintf(`[Unit]
 Description=signbox-cli VPN background service
-After=network-online.target
+After=network-online.target default.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+WorkingDirectory=%s
 ExecStart=%s --start
 ExecStop=%s --stop
 Restart=on-failure
 RestartSec=5
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:%s
 
 [Install]
 WantedBy=default.target
-`, execPath, execPath)
+`, workDir, execPath, execPath, filepath.Dir(execPath))
 
 	if err := os.WriteFile(servicePath, []byte(content), 0644); err != nil {
 		return "", fmt.Errorf("failed to write service file: %w", err)

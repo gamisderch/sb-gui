@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
+
+func init() {
+	testCfgPath := filepath.Join(os.TempDir(), "sb-cli-test-config.json")
+	_ = os.Setenv("SB_CONFIG_PATH", testCfgPath)
+}
 
 
 func createTestModel() *Model {
@@ -270,13 +277,14 @@ func TestMainViewRenderingExactDimensions(t *testing.T) {
 }
 
 func TestAllViewsSolidBackgroundAndDimensions(t *testing.T) {
-	views := []ViewType{ViewMain, ViewProc, ViewSettings, ViewTheme, ViewGeoRules}
+	views := []ViewType{ViewMain, ViewProc, ViewSettings, ViewTheme, ViewGeoRules, ViewLogs}
 	viewNames := map[ViewType]string{
 		ViewMain:     "ViewMain",
 		ViewProc:     "ViewProc",
 		ViewSettings: "ViewSettings",
 		ViewTheme:    "ViewTheme",
 		ViewGeoRules: "ViewGeoRules",
+		ViewLogs:     "ViewLogs",
 	}
 
 	for _, v := range views {
@@ -912,8 +920,68 @@ func TestQuitModalPreservesSideBorders(t *testing.T) {
 	}
 }
 
+func TestLogsViewTabCyclingAndNavigation(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewMain
 
+	// 1. Press "L" to open ViewLogs
+	newModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'L'}})
+	m = newModel.(*Model)
+	if m.view != ViewLogs {
+		t.Fatalf("expected view to be ViewLogs after pressing 'L', got %v", m.view)
+	}
+	if m.logActiveTab != LogTabMain {
+		t.Fatalf("expected initial tab to be LogTabMain (0), got %v", m.logActiveTab)
+	}
 
+	// 2. Press Tab to cycle through tabs
+	expectedTabs := []LogTab{LogTabCore, LogTabTunnel, LogTabSub, LogTabDaemon, LogTabMain}
+	for i, exp := range expectedTabs {
+		newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m = newModel.(*Model)
+		if m.logActiveTab != exp {
+			t.Fatalf("step %d: expected active tab %v after Tab, got %v", i+1, exp, m.logActiveTab)
+		}
+	}
 
+	// 3. Jump directly with number keys
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = newModel.(*Model)
+	if m.logActiveTab != LogTabTunnel {
+		t.Fatalf("expected LogTabTunnel after pressing '3', got %v", m.logActiveTab)
+	}
 
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}})
+	m = newModel.(*Model)
+	if m.logActiveTab != LogTabSub {
+		t.Fatalf("expected LogTabSub after pressing '4', got %v", m.logActiveTab)
+	}
 
+	// 4. Press Shift+Tab to cycle backwards
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = newModel.(*Model)
+	if m.logActiveTab != LogTabTunnel {
+		t.Fatalf("expected LogTabTunnel after Shift+Tab from Sub, got %v", m.logActiveTab)
+	}
+
+	// 5. Press Esc to return to ViewMain
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = newModel.(*Model)
+	if m.view != ViewMain {
+		t.Fatalf("expected view to be ViewMain after Esc, got %v", m.view)
+	}
+
+	// 6. Test Cyrillic 'Д' ('L') opens logs
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'Д'}})
+	m = newModel.(*Model)
+	if m.view != ViewLogs {
+		t.Fatalf("expected view to be ViewLogs after pressing Cyrillic 'Д', got %v", m.view)
+	}
+
+	// 7. Press 'q' to return to ViewMain
+	newModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m = newModel.(*Model)
+	if m.view != ViewMain {
+		t.Fatalf("expected view to be ViewMain after 'q', got %v", m.view)
+	}
+}

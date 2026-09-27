@@ -21,6 +21,9 @@ type ConfigData struct {
 
 // GetConfigPath returns ~/.config/sb-cli/config.json
 func GetConfigPath() (string, error) {
+	if custom := os.Getenv("SB_CONFIG_PATH"); custom != "" {
+		return custom, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err

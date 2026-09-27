@@ -28,6 +28,7 @@ const (
 	ViewSettings
 	ViewTheme
 	ViewGeoRules
+	ViewLogs
 )
 
 // Model is the main bubbletea state
@@ -105,6 +106,12 @@ type Model struct {
 	// Confirmation modal state & background lifecycle
 	confirmQuit     bool
 	keepAliveOnExit bool
+
+	// Logs View state
+	logActiveTab     LogTab
+	logScrollOffsets map[LogTab]int
+	logAutoFollow    map[LogTab]bool
+	logCache         map[LogTab][]string
 }
 
 
@@ -143,6 +150,16 @@ func NewModel(state *model.AppState, procMgr *process.ProcessManager, engine *co
 		settingsModeIdx:   0,
 		geoActionSelect:   model.GeoActionDirect,
 		keepAliveOnExit:   false,
+		logActiveTab:      LogTabMain,
+		logScrollOffsets:  make(map[LogTab]int),
+		logAutoFollow: map[LogTab]bool{
+			LogTabMain:   true,
+			LogTabCore:   true,
+			LogTabTunnel: true,
+			LogTabSub:    true,
+			LogTabDaemon: true,
+		},
+		logCache: make(map[LogTab][]string),
 	}
 
 	vpn, bypass, _ := procMgr.Refresh()
@@ -156,7 +173,27 @@ func NewModel(state *model.AppState, procMgr *process.ProcessManager, engine *co
 		m.selectedRightPID = bypass[0].PID
 	}
 
+	m.selectActiveNode()
+
 	return m
+}
+
+func (m *Model) selectActiveNode() {
+	if m.state == nil || m.state.ActiveNode == nil {
+		return
+	}
+	items := m.getServerListItems()
+	for idx, it := range items {
+		if !it.IsHeader && it.Node != nil {
+			if it.Node.ID == m.state.ActiveNode.ID || (it.Node.RawURI != "" && it.Node.RawURI == m.state.ActiveNode.RawURI) {
+				m.selectedNodeIdx = idx
+				if m.selectedNodeIdx > 5 {
+					m.nodeScrollOffset = m.selectedNodeIdx - 5
+				}
+				return
+			}
+		}
+	}
 }
 
 type tickMsg time.Time
@@ -229,6 +266,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view == ViewProc && m.procTickCounter >= 2 {
 			m.procTickCounter = 0
 			m.refreshProcessesWithFrozenAnchor()
+		}
+
+		if m.view == ViewLogs && m.logCache != nil {
+			delete(m.logCache, m.logActiveTab)
 		}
 
 		return m, tickCmd()
@@ -314,6 +355,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollNodeWheel(-3)
 			} else if msg.Button == tea.MouseButtonWheelDown {
 				m.scrollNodeWheel(3)
+			}
+			return m, nil
+		} else if m.view == ViewLogs {
+			if msg.Button == tea.MouseButtonWheelUp {
+				m.scrollLogsWheel(-3)
+			} else if msg.Button == tea.MouseButtonWheelDown {
+				m.scrollLogsWheel(3)
 			}
 			return m, nil
 		}
@@ -715,7 +763,7 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "q":
-		if m.view == ViewProc || m.view == ViewSettings || m.view == ViewTheme || m.view == ViewGeoRules {
+		if m.view == ViewProc || m.view == ViewSettings || m.view == ViewTheme || m.view == ViewGeoRules || m.view == ViewLogs {
 			if m.view == ViewGeoRules {
 				if m.geoInActionView {
 					m.geoInActionView = false
@@ -747,6 +795,14 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "L":
+		if m.view == ViewLogs {
+			m.view = ViewMain
+		} else {
+			m.view = ViewLogs
+		}
+		return m, nil
+
 	case "`", "~":
 		if m.view == ViewSettings {
 			m.view = ViewMain
@@ -768,6 +824,8 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleThemeKeys(key)
 	case ViewGeoRules:
 		return m.handleGeoKeys(key)
+	case ViewLogs:
+		return m.handleLogsKeys(key)
 	}
 
 	return m, nil
@@ -959,6 +1017,7 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 	case "u", "U":
 		m.statusMessage = "Updating subscriptions..."
 		m.statusIsError = false
+		core.LogSub("User triggered subscription update...")
 		var cmds []tea.Cmd
 		for _, sub := range m.state.Subscriptions {
 			if sub.URL != "" {
@@ -966,6 +1025,7 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, func() tea.Msg {
 					updated, err := m.fetcher.FetchSubscription(s.URL, s.Name)
 					if err != nil {
+						core.LogSub("Failed to update subscription %s: %v", s.Name, err)
 						return subFetchedMsg{err: err}
 					}
 					s.Nodes = updated.Nodes
@@ -973,12 +1033,25 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 					s.Download = updated.Download
 					s.Total = updated.Total
 					s.UpdatedAt = time.Now()
+					core.LogSub("Successfully updated subscription %s: %d nodes", s.Name, len(s.Nodes))
+					if m.state.ActiveNode != nil {
+						for _, n := range updated.Nodes {
+							if n.ID == m.state.ActiveNode.ID || (n.RawURI != "" && n.RawURI == m.state.ActiveNode.RawURI) || (n.Name == m.state.ActiveNode.Name && n.Address == m.state.ActiveNode.Address && n.Port == m.state.ActiveNode.Port) {
+								m.state.ActiveNode = n
+								break
+							}
+						}
+					}
 					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 					return subFetchedMsg{sub: nil}
 				})
 			}
 		}
 		return m, tea.Batch(cmds...)
+
+	case "l", "L":
+		m.view = ViewLogs
+		return m, nil
 	}
 
 	return m, nil
@@ -1218,6 +1291,10 @@ func (m *Model) handleSettingsKeys(key string) (tea.Model, tea.Cmd) {
 		m.geoModeAdd = false
 		m.geoInActionView = false
 		m.geoActionIdx = 0
+		return m, nil
+
+	case "l", "L":
+		m.view = ViewLogs
 		return m, nil
 
 	case "up", "k":
@@ -1717,6 +1794,8 @@ func (m *Model) View() string {
 		body = m.RenderThemeView()
 	case ViewGeoRules:
 		body = m.RenderGeoView()
+	case ViewLogs:
+		body = m.RenderLogsView()
 	}
 
 	header := m.renderTopBar()
@@ -1982,6 +2061,7 @@ func (m *Model) renderFooter() string {
 			RenderFooterButton("t", "test ping"),
 			RenderFooterButton("u", "update subs"),
 			RenderFooterButton("p", "processes"),
+			RenderFooterButton("L", "logs"),
 			RenderFooterButton("`", "settings"),
 			RenderFooterButton("q", "quit"),
 		}, "")
@@ -1996,6 +2076,7 @@ func (m *Model) renderFooter() string {
 			RenderFooterButton("e", "collapse"),
 			RenderFooterButton("f", "filter"),
 			RenderFooterButton("del", "clear"),
+			RenderFooterButton("L", "logs"),
 			RenderFooterButton("q", "back"),
 		}, "")
 
@@ -2005,6 +2086,7 @@ func (m *Model) renderFooter() string {
 			RenderFooterButton("↵", "select/toggle"),
 			RenderFooterButton("g", "geo rules"),
 			RenderFooterButton("t", "theme studio"),
+			RenderFooterButton("L", "logs"),
 			RenderFooterButton("`", "back to dashboard"),
 			RenderFooterButton("q", "back"),
 		}, "")
@@ -2055,6 +2137,17 @@ func (m *Model) renderFooter() string {
 				RenderFooterButton("q/esc", "back to settings"),
 			}, "")
 		}
+
+	case ViewLogs:
+		buttons = strings.Join([]string{
+			RenderFooterButton("tab", "next tab"),
+			RenderFooterButton("↑/↓", "scroll"),
+			RenderFooterButton("pgup/dn", "page"),
+			RenderFooterButton("f", "follow"),
+			RenderFooterButton("r", "refresh"),
+			RenderFooterButton("c", "clear"),
+			RenderFooterButton("q/esc", "back"),
+		}, "")
 	}
 
 	return lipgloss.NewStyle().Width(m.width).Background(ColorBg).Render(" " + buttons)

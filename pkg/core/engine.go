@@ -40,26 +40,51 @@ type Engine struct {
 	geoMgr          *geo.Manager
 }
 
+func resolveBinary(name string) string {
+	// 1. Next to the sb-cli executable
+	if execPath, err := os.Executable(); err == nil {
+		if realExec, err := filepath.EvalSymlinks(execPath); err == nil {
+			binDir := filepath.Dir(realExec)
+			p := filepath.Join(binDir, name)
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return p
+			}
+			p = filepath.Join(binDir, "bin", name)
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return p
+			}
+			p = filepath.Join(binDir, "..", "bin", name)
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return filepath.Clean(p)
+			}
+		}
+	}
+	// 2. Relative to working dir
+	rel := filepath.Join("./bin", name)
+	if fi, err := os.Stat(rel); err == nil && !fi.IsDir() {
+		if abs, err := filepath.Abs(rel); err == nil {
+			return abs
+		}
+		return rel
+	}
+	// 3. System PATH
+	if path, err := exec.LookPath(name); err == nil {
+		return path
+	}
+	// 4. Well-known fallback
+	happPath := filepath.Join("/opt/happ/bin/core", name)
+	if fi, err := os.Stat(happPath); err == nil && !fi.IsDir() {
+		return happPath
+	}
+	return filepath.Join("./bin", name)
+}
+
 // NewEngine creates an Engine instance
 func NewEngine() *Engine {
-	xrayPath := "./bin/xray"
-	if _, err := os.Stat(xrayPath); err != nil {
-		if path, err := exec.LookPath("xray"); err == nil {
-			xrayPath = path
-		} else if _, err := os.Stat("/opt/happ/bin/core/xray"); err == nil {
-			xrayPath = "/opt/happ/bin/core/xray"
-		}
-	}
+	xrayPath := resolveBinary("xray")
+	sbPath := resolveBinary("sing-box")
 
-	sbPath := "./bin/sing-box"
-	if _, err := os.Stat(sbPath); err != nil {
-		if path, err := exec.LookPath("sing-box"); err == nil {
-			sbPath = path
-		}
-	}
-
-	tmpDir := filepath.Join(os.TempDir(), "sb-cli")
-	_ = os.MkdirAll(tmpDir, 0755)
+	tmpDir := EnsureLogDir()
 
 	return &Engine{
 		xrayBin:         xrayPath,
@@ -102,15 +127,23 @@ func (e *Engine) IsRunning() bool {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(pidData))); err == nil && pid > 0 {
 			if proc, err := os.FindProcess(pid); err == nil {
 				if err := proc.Signal(syscall.Signal(0)); err == nil {
-					return true
+					// Verify this is actually sing-box or xray
+					if comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil {
+						commStr := strings.TrimSpace(string(comm))
+						if strings.Contains(commStr, "sing-box") || strings.Contains(commStr, "xray") {
+							return true
+						}
+					}
 				}
 			}
 		}
 	}
 
-	// Check if tun0 interface is active
+	// Check if tun0 interface is active AND at least one sing-box process exists in system
 	if iface, err := net.InterfaceByName("tun0"); err == nil && iface != nil {
-		return true
+		if out, err := exec.Command("pgrep", "-x", "sing-box").Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			return true
+		}
 	}
 
 	return false
@@ -147,11 +180,14 @@ func (e *Engine) Start(node *model.ProxyNode, bypassList []string, geoRules []*m
 	e.bypassList = bypassList
 	e.geoRules = geoRules
 
+	LogInfo("Initiating connection to node: %s (%s:%d) [%s]", node.Name, node.Address, node.Port, node.Protocol)
+
 	// Stop existing processes and kill any orphans holding tun0 / ports
 	e.stopLocked()
 
 	// 1. Start Xray (handles VLESS Reality with SpiderX, Shadowsocks, Trojan)
 	if err := e.startXray(node); err != nil {
+		LogError("Failed to start proxy core (xray): %v", err)
 		return fmt.Errorf("failed to start proxy core (xray): %w", err)
 	}
 
@@ -160,28 +196,33 @@ func (e *Engine) Start(node *model.ProxyNode, bypassList []string, geoRules []*m
 		if strings.Contains(err.Error(), "TUNSETIFF: operation not permitted") {
 			e.HasTunCap = false
 			e.isRunning = true
+			LogWarn("TUN permission error (cap_net_admin required), falling back to System Proxy :2080")
 			return fmt.Errorf("tun_perm_error")
 		}
 
 		// If device or resource busy, an orphan may be holding tun0; force kill and retry once
 		if strings.Contains(err.Error(), "device or resource busy") {
+			LogWarn("TUN interface busy; attempting orphan cleanup and retry")
 			killExistingCores()
 			waitForTunReleased(1 * time.Second)
 			if retryErr := e.startSingboxTUN(node, bypassList, geoRules); retryErr == nil {
 				e.HasTunCap = true
 				e.isRunning = true
+				LogInfo("sing-box TUN successfully started after retry")
 				return nil
 			}
 		}
 
 		e.HasTunCap = false
 		e.stopLocked()
+		LogError("Failed to start sing-box TUN: %v", err)
 		return fmt.Errorf("failed to start sing-box TUN: %w", err)
 	} else {
 		e.HasTunCap = true
 	}
 
 	e.isRunning = true
+	LogInfo("VPN tunnel active and running. TUN interface established.")
 	return nil
 }
 
@@ -270,6 +311,9 @@ func (e *Engine) stopSingBoxLocked() {
 }
 
 func (e *Engine) stopLocked() {
+	if e.isRunning {
+		LogInfo("Stopping VPN tunnel and releasing network interfaces")
+	}
 	e.stopSingBoxLocked()
 	if e.cmdXray != nil && e.cmdXray.Process != nil {
 		proc := e.cmdXray.Process

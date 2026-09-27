@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"signbox-cli/pkg/core"
 	"signbox-cli/pkg/model"
@@ -63,7 +64,7 @@ func main() {
 						n.Port = reParsed.Port
 					}
 				}
-				if cfg.ActiveNodeID != "" && n.ID == cfg.ActiveNodeID {
+				if cfg.ActiveNodeID != "" && (n.ID == cfg.ActiveNodeID || (n.RawURI != "" && n.RawURI == cfg.ActiveNodeID)) {
 					state.ActiveNode = n
 				}
 			}
@@ -100,29 +101,50 @@ func main() {
 		arg := os.Args[1]
 		switch arg {
 		case "--start", "-start", "--daemon", "-d":
+			core.EnsureLogDir()
 			if engine.IsRunning() {
+				core.LogDaemon("VPN tunnel is already running.")
 				fmt.Println("signbox-cli: VPN tunnel is already running.")
 				return
 			}
 			if state.ActiveNode == nil {
+				core.LogDaemon("Error: No proxy node configured.")
 				fmt.Fprintln(os.Stderr, "Error: No proxy node configured. Please run 'sb-cli' to add a subscription first.")
 				os.Exit(1)
 			}
+			core.LogDaemon("Starting VPN tunnel to %s (%s:%d)...", state.ActiveNode.Name, state.ActiveNode.Address, state.ActiveNode.Port)
 			fmt.Printf("Starting VPN tunnel to %s (%s:%d)...\n", state.ActiveNode.Name, state.ActiveNode.Address, state.ActiveNode.Port)
-			if err := engine.Start(state.ActiveNode, bypassList, state.GeoRules); err != nil {
-				fmt.Fprintf(os.Stderr, "Error starting VPN: %v\n", err)
+			var startErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				startErr = engine.Start(state.ActiveNode, bypassList, state.GeoRules)
+				if startErr == nil {
+					break
+				}
+				core.LogDaemon("Start attempt %d failed: %v", attempt, startErr)
+				if attempt < 3 {
+					time.Sleep(2 * time.Second)
+				}
+			}
+			if startErr != nil {
+				core.LogDaemon("Error starting VPN: %v", startErr)
+				fmt.Fprintf(os.Stderr, "Error starting VPN: %v\n", startErr)
 				os.Exit(1)
 			}
+			core.LogDaemon("VPN tunnel started successfully in background.")
 			fmt.Println("VPN tunnel started successfully in background.")
 			return
 
 		case "--stop", "-stop":
+			core.EnsureLogDir()
+			core.LogDaemon("Stopping VPN tunnel and releasing interfaces...")
 			if !engine.IsRunning() {
+				core.LogDaemon("VPN is not running.")
 				fmt.Println("signbox-cli: VPN is not running.")
 				return
 			}
 			fmt.Println("Stopping VPN tunnel and releasing interfaces...")
 			_ = engine.Stop()
+			core.LogDaemon("VPN tunnel stopped.")
 			fmt.Println("VPN tunnel stopped.")
 			return
 
