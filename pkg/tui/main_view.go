@@ -138,22 +138,11 @@ func (m *Model) renderServersPanel(width, height int) string {
 	for r := 0; r < visibleHeight; r++ {
 		itemIdx := m.nodeScrollOffset + r
 
-		// Scrollbar char
-		var scrollChar string
-		if totalItems > visibleHeight {
-			if r >= thumbStart && r < thumbStart+thumbSize {
-				scrollChar = lipgloss.NewStyle().Foreground(ColorPrimary).Background(ColorBg).Bold(true).Render("█")
-			} else {
-				scrollChar = lipgloss.NewStyle().Foreground(ColorTreeLine).Background(ColorBg).Render("│")
-			}
-		} else {
-			scrollChar = lipgloss.NewStyle().Background(ColorBg).Render(" ")
-		}
-
 		var rowStr string
+		var isSelected bool
 		if itemIdx < totalItems {
 			item := items[itemIdx]
-			isSelected := (itemIdx == m.selectedNodeIdx)
+			isSelected = (itemIdx == m.selectedNodeIdx)
 			if item.IsHeader {
 				rowStr = m.formatHeaderRow(item, rowWidth, isSelected)
 			} else {
@@ -167,7 +156,30 @@ func (m *Model) renderServersPanel(width, height int) string {
 			}
 		}
 
-		innerLines = append(innerLines, rowStr+scrollChar)
+		// Scrollbar char with matching background for selected rows
+		scrollBg := ColorBg
+		if isSelected {
+			scrollBg = ColorSelection
+		}
+		var scrollChar string
+		if totalItems > visibleHeight {
+			if r >= thumbStart && r < thumbStart+thumbSize {
+				scrollChar = lipgloss.NewStyle().Foreground(ColorPrimary).Background(scrollBg).Bold(true).Render("█")
+			} else {
+				scrollChar = lipgloss.NewStyle().Foreground(ColorTreeLine).Background(scrollBg).Render("│")
+			}
+		} else {
+			scrollChar = lipgloss.NewStyle().Background(scrollBg).Render(" ")
+		}
+
+		fullRow := rowStr + scrollChar
+		rowBg := ColorBg
+		if isSelected {
+			rowBg = ColorSelection
+		}
+		fullRow = padLineWithBg(fullRow, innerWidth, rowBg)
+
+		innerLines = append(innerLines, fullRow)
 	}
 
 	// Pad or truncate to exactly height - 2 lines
@@ -216,26 +228,37 @@ func (m *Model) formatHeaderRow(item ServerListItem, width int, isSelected bool)
 	trafficStr := item.Sub.FormatTraffic()
 
 	title := fmt.Sprintf(" %s [%s] %s%s", icon, item.Sub.Name, countStr, statusTag)
-	titleW := lipgloss.Width(title)
 	trafW := lipgloss.Width(trafficStr)
+	rightW := trafW + 1 // trafficStr + trailing space
 
-	slack := width - titleW - trafW - 2
-	if slack < 1 {
-		slack = 1
+	// Reserve space for right side traffic and at least 1 space separator
+	availTitleW := width - rightW - 1
+	if availTitleW < 8 {
+		availTitleW = 8
+	}
+	if lipgloss.Width(title) > availTitleW {
+		title = ansi.Truncate(title, availTitleW-2, "") + ".."
 	}
 
+	titleW := lipgloss.Width(title)
+	slack := width - titleW - rightW
+	if slack < 0 {
+		slack = 0
+	}
+
+	bg := ColorBg
 	if isSelected {
-		selBg := ColorSelection
-		sTitle := lipgloss.NewStyle().Foreground(ColorSecondary).Background(selBg).Bold(true).Render(title)
-		sSlack := lipgloss.NewStyle().Background(selBg).Render(strings.Repeat(" ", slack))
-		sTraf := lipgloss.NewStyle().Foreground(ColorWhite).Background(selBg).Render(trafficStr + " ")
-		return sTitle + sSlack + sTraf
+		bg = ColorSelection
+		sTitle := lipgloss.NewStyle().Foreground(ColorSecondary).Background(bg).Bold(true).Render(title)
+		sSlack := lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", slack))
+		sTraf := lipgloss.NewStyle().Foreground(ColorWhite).Background(bg).Render(trafficStr + " ")
+		return padLineWithBg(sTitle+sSlack+sTraf, width, bg)
 	}
 
-	sTitle := lipgloss.NewStyle().Foreground(ColorSecondary).Background(ColorBg).Bold(true).Render(title)
-	sSlack := lipgloss.NewStyle().Background(ColorBg).Render(strings.Repeat(" ", slack))
-	sTraf := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(trafficStr + " ")
-	return sTitle + sSlack + sTraf
+	sTitle := lipgloss.NewStyle().Foreground(ColorSecondary).Background(bg).Bold(true).Render(title)
+	sSlack := lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", slack))
+	sTraf := lipgloss.NewStyle().Foreground(ColorMuted).Background(bg).Render(trafficStr + " ")
+	return padLineWithBg(sTitle+sSlack+sTraf, width, bg)
 }
 
 func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width int, isSelected bool) string {
@@ -296,7 +319,8 @@ func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width i
 		sPing := pingStyle.Render(fmt.Sprintf("%*s", pingW, pingStr))
 		sp := lipgloss.NewStyle().Background(selBg).Render(" ")
 
-		return sIndent + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
+		row := sIndent + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
+		return padLineWithBg(row, width, selBg)
 	}
 
 	// Unselected row: distance gradient on node name (same as btop proc_view)
@@ -328,7 +352,8 @@ func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width i
 	sPing := pingStyle.Render(fmt.Sprintf("%*s", pingW, pingStr))
 	sp := lipgloss.NewStyle().Background(ColorBg).Render(" ")
 
-	return sIndent + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
+	row := sIndent + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
+	return padLineWithBg(row, width, ColorBg)
 }
 
 func (m *Model) renderDashboardPanel(width, height int) string {
@@ -483,13 +508,17 @@ func (m *Model) renderDashboardPanel(width, height int) string {
 }
 
 func padLine(content string, targetWidth int) string {
+	return padLineWithBg(content, targetWidth, ColorBg)
+}
+
+func padLineWithBg(content string, targetWidth int, bg lipgloss.TerminalColor) string {
 	w := lipgloss.Width(content)
 	if w > targetWidth {
 		content = ansi.Truncate(content, targetWidth, "")
 		w = lipgloss.Width(content)
 	}
 	if w < targetWidth {
-		content = content + lipgloss.NewStyle().Background(ColorBg).Render(strings.Repeat(" ", targetWidth-w))
+		content = content + lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", targetWidth-w))
 	}
 	return content
 }

@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 
@@ -835,6 +836,82 @@ func TestUptimeFormattingAndReconnection(t *testing.T) {
 		t.Fatalf("expected sane ConnectedAt, got %v", m.state.ConnectedAt)
 	}
 }
+
+func TestMainViewBorderAlignmentWithLongHeader(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewMain
+	m.width = 80
+	m.height = 24
+
+	// Add subscription with very long name and traffic that previously caused overflow
+	longSub := &model.Subscription{
+		ID:   "sub-long",
+		Name: "177.1.202.124:2096-extremely-long-domain-name-that-overflows",
+		Nodes: []*model.ProxyNode{
+			{ID: "n1", Name: "tcp-tcp-pc", Protocol: "vless"},
+		},
+		Upload:   100 * 1024 * 1024 * 1024,
+		Download: 110 * 1024 * 1024 * 1024,
+		Total:    0,
+	}
+	m.state.Subscriptions = []*model.Subscription{longSub}
+	m.selectedNodeIdx = 0 // Selected on the header row
+
+	rendered := m.RenderMainView()
+	lines := strings.Split(rendered, "\n")
+	for i, line := range lines {
+		w := lipgloss.Width(line)
+		if w != m.width {
+			t.Fatalf("line %d width %d != %d: %q", i, w, m.width, line)
+		}
+		// Check that the line ends with right border │
+		stripped := ansi.Strip(line)
+		if !strings.HasSuffix(stripped, "│") && !strings.HasSuffix(stripped, "╮") && !strings.HasSuffix(stripped, "╯") {
+			t.Fatalf("line %d does not end with border char: %q", i, stripped)
+		}
+	}
+}
+
+func TestQuitModalPreservesSideBorders(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewMain
+	m.width = 100
+	m.height = 26
+	m.confirmQuit = true
+	m.state.IsConnected = true
+
+	rendered := m.View()
+	lines := strings.Split(rendered, "\n")
+	if len(lines) != m.height {
+		t.Fatalf("expected %d lines, got %d", m.height, len(lines))
+	}
+
+	// Modal starts around line 7 to line 17
+	foundModal := false
+	for i, line := range lines {
+		w := lipgloss.Width(line)
+		if w != m.width {
+			t.Fatalf("line %d width %d != %d", i, w, m.width)
+		}
+		stripped := ansi.Strip(line)
+		if strings.Contains(stripped, "Confirm Exit") {
+			foundModal = true
+		}
+		// On lines containing modal options, verify that the left and right outer borders still exist
+		if strings.Contains(stripped, "Keep VPN in background") || strings.Contains(stripped, "Disconnect VPN") {
+			if !strings.HasPrefix(stripped, "│") && !strings.HasPrefix(stripped, "╭") {
+				t.Fatalf("line %d lost left outer border: %q", i, stripped)
+			}
+			if !strings.HasSuffix(stripped, "│") && !strings.HasSuffix(stripped, "╮") && !strings.HasSuffix(stripped, "╯") {
+				t.Fatalf("line %d lost right outer border: %q", i, stripped)
+			}
+		}
+	}
+	if !foundModal {
+		t.Fatalf("did not find Confirm Exit in rendered view")
+	}
+}
+
 
 
 

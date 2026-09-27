@@ -1824,13 +1824,29 @@ func (m *Model) overlayQuitConfirm(raw string) string {
 		if lineIdx >= len(screenLines) {
 			break
 		}
-		leftPad := strings.Repeat(" ", startX)
-		rightPad := ""
-		remaining := m.width - startX - boxW
-		if remaining > 0 {
-			rightPad = strings.Repeat(" ", remaining)
+		origLine := screenLines[lineIdx]
+
+		// Extract left part of the background line to preserve borders and panels
+		leftPart := ansi.Truncate(origLine, startX, "")
+		leftW := lipgloss.Width(leftPart)
+		if leftW < startX {
+			leftPart += lipgloss.NewStyle().Background(ColorBg).Render(strings.Repeat(" ", startX-leftW))
 		}
-		screenLines[lineIdx] = leftPad + bLine + rightPad
+
+		// Extract right part of the background line to preserve borders and panels
+		expectedRightW := m.width - (startX + boxW)
+		if expectedRightW < 0 {
+			expectedRightW = 0
+		}
+		rightPart := ansi.TruncateLeft(origLine, startX+boxW, "")
+		rightW := lipgloss.Width(rightPart)
+		if rightW < expectedRightW {
+			rightPart += lipgloss.NewStyle().Background(ColorBg).Render(strings.Repeat(" ", expectedRightW-rightW))
+		} else if rightW > expectedRightW {
+			rightPart = ansi.Truncate(rightPart, expectedRightW, "")
+		}
+
+		screenLines[lineIdx] = leftPart + bLine + rightPart
 	}
 
 	return strings.Join(screenLines, "\n")
