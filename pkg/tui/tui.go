@@ -51,6 +51,7 @@ type Model struct {
 	// Main View state
 	selectedNodeIdx  int
 	nodeScrollOffset int
+	collapsedSubs    map[string]bool
 	mainFilterActive bool
 	mainFilterQuery  string
 	rxHistory        []float64
@@ -132,6 +133,7 @@ func NewModel(state *model.AppState, procMgr *process.ProcessManager, engine *co
 		customUATextInput: uaInput,
 		selectedNodeIdx:   0,
 		nodeScrollOffset:  0,
+		collapsedSubs:     make(map[string]bool),
 		mainFilterActive:  false,
 		rxHistory:         make([]float64, 30),
 		txHistory:         make([]float64, 30),
@@ -199,7 +201,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		if m.engine != nil {
+			wasConnected := m.state.IsConnected
 			m.state.IsConnected = m.engine.IsRunning()
+			if m.state.IsConnected {
+				if !wasConnected || m.state.ConnectedAt.IsZero() || time.Since(m.state.ConnectedAt) < 0 || time.Since(m.state.ConnectedAt) > 365*24*time.Hour {
+					m.state.ConnectedAt = m.engine.GetConnectedAt()
+				}
+			}
 		}
 
 		if m.state.IsConnected {
@@ -414,8 +422,8 @@ func (m *Model) getNodeVisibleHeight() int {
 }
 
 func (m *Model) clampNodeState() {
-	nodes := m.getFilteredNodes()
-	total := len(nodes)
+	items := m.getServerListItems()
+	total := len(items)
 	vis := m.getNodeVisibleHeight()
 
 	if total == 0 {
@@ -444,9 +452,9 @@ func (m *Model) clampNodeState() {
 }
 
 func (m *Model) scrollNodeWheel(delta int) {
-	nodes := m.getFilteredNodes()
+	items := m.getServerListItems()
 	vis := m.getNodeVisibleHeight()
-	maxScroll := len(nodes) - vis
+	maxScroll := len(items) - vis
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -457,6 +465,19 @@ func (m *Model) scrollNodeWheel(delta int) {
 	if m.nodeScrollOffset < 0 {
 		m.nodeScrollOffset = 0
 	}
+}
+
+func formatUptime(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%02dh %02dm %02ds", h, m, s)
+	}
+	return fmt.Sprintf("%02dm %02ds", m, s)
 }
 
 func (m *Model) ShouldKeepVPNAlive() bool {
@@ -754,7 +775,7 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 	m.clampNodeState()
-	nodes := m.getFilteredNodes()
+	items := m.getServerListItems()
 	vis := m.getNodeVisibleHeight()
 
 	switch key {
@@ -766,7 +787,7 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "down", "j":
-		if m.selectedNodeIdx < len(nodes)-1 {
+		if m.selectedNodeIdx < len(items)-1 {
 			m.selectedNodeIdx++
 			if m.selectedNodeIdx >= m.nodeScrollOffset+vis {
 				m.nodeScrollOffset = m.selectedNodeIdx - vis + 1
@@ -776,9 +797,9 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 		m.selectedNodeIdx = 0
 		m.nodeScrollOffset = 0
 	case "end":
-		if len(nodes) > 0 {
-			m.selectedNodeIdx = len(nodes) - 1
-			maxScroll := len(nodes) - vis
+		if len(items) > 0 {
+			m.selectedNodeIdx = len(items) - 1
+			maxScroll := len(items) - vis
 			if maxScroll < 0 {
 				maxScroll = 0
 			}
@@ -795,11 +816,11 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 		}
 	case "pagedown":
 		m.selectedNodeIdx += vis
-		if m.selectedNodeIdx >= len(nodes) {
-			m.selectedNodeIdx = len(nodes) - 1
+		if m.selectedNodeIdx >= len(items) {
+			m.selectedNodeIdx = len(items) - 1
 		}
 		m.nodeScrollOffset += vis
-		maxScroll := len(nodes) - vis
+		maxScroll := len(items) - vis
 		if maxScroll < 0 {
 			maxScroll = 0
 		}
@@ -815,35 +836,123 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 		m.textInput.Reset()
 		m.textInput.Focus()
 
-	case "c", "enter":
-		if len(nodes) > 0 && m.selectedNodeIdx < len(nodes) {
-			targetNode := nodes[m.selectedNodeIdx]
-			if m.state.IsConnected && m.state.ActiveNode != nil && m.state.ActiveNode.ID == targetNode.ID {
-				_ = m.engine.Stop()
-				m.state.IsConnected = false
-				m.statusMessage = "Disconnected."
-				m.statusIsError = false
-			} else {
-				m.state.ActiveNode = targetNode
-				m.statusMessage = fmt.Sprintf("Connecting to %s...", targetNode.Name)
-				m.statusIsError = false
-				_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+	case "e":
+		if len(items) > 0 && m.selectedNodeIdx < len(items) {
+			curr := items[m.selectedNodeIdx]
+			if curr.IsHeader {
+				if m.collapsedSubs == nil {
+					m.collapsedSubs = make(map[string]bool)
+				}
+				m.collapsedSubs[curr.Sub.ID] = !curr.Collapsed
+			} else if curr.Sub != nil {
+				if m.collapsedSubs == nil {
+					m.collapsedSubs = make(map[string]bool)
+				}
+				m.collapsedSubs[curr.Sub.ID] = true
+				// Locate header of this sub and move cursor there
+				updatedItems := m.getServerListItems()
+				for idx, it := range updatedItems {
+					if it.IsHeader && it.Sub.ID == curr.Sub.ID {
+						m.selectedNodeIdx = idx
+						break
+					}
+				}
+			}
+			m.clampNodeState()
+		}
+		return m, nil
 
-				return m, func() tea.Msg {
-					err := m.engine.Start(targetNode, m.procMgr.GetBypassNamesList(), m.state.GeoRules)
-					return connectResultMsg{err: err}
+	case "E":
+		// Toggle collapse/expand ALL subscriptions
+		if m.collapsedSubs == nil {
+			m.collapsedSubs = make(map[string]bool)
+		}
+		anyExpanded := false
+		for _, sub := range m.state.Subscriptions {
+			if !m.collapsedSubs[sub.ID] {
+				anyExpanded = true
+				break
+			}
+		}
+		for _, sub := range m.state.Subscriptions {
+			m.collapsedSubs[sub.ID] = anyExpanded
+		}
+		m.clampNodeState()
+		return m, nil
+
+	case " ", "enter":
+		if len(items) > 0 && m.selectedNodeIdx < len(items) {
+			curr := items[m.selectedNodeIdx]
+			if curr.IsHeader {
+				if m.collapsedSubs == nil {
+					m.collapsedSubs = make(map[string]bool)
+				}
+				m.collapsedSubs[curr.Sub.ID] = !curr.Collapsed
+				m.clampNodeState()
+				return m, nil
+			} else if curr.Node != nil {
+				targetNode := curr.Node
+				if m.state.IsConnected && m.state.ActiveNode != nil && m.state.ActiveNode.ID == targetNode.ID {
+					_ = m.engine.Stop()
+					m.state.IsConnected = false
+					m.statusMessage = "Disconnected."
+					m.statusIsError = false
+				} else {
+					m.state.ActiveNode = targetNode
+					m.statusMessage = fmt.Sprintf("Connecting to %s...", targetNode.Name)
+					m.statusIsError = false
+					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+
+					return m, func() tea.Msg {
+						err := m.engine.Start(targetNode, m.procMgr.GetBypassNamesList(), m.state.GeoRules)
+						return connectResultMsg{err: err}
+					}
+				}
+			}
+		}
+
+	case "c", "C":
+		if len(items) > 0 && m.selectedNodeIdx < len(items) {
+			curr := items[m.selectedNodeIdx]
+			var targetNode *model.ProxyNode
+			if curr.IsHeader {
+				if len(curr.Sub.Nodes) > 0 {
+					targetNode = curr.Sub.Nodes[0]
+				}
+			} else {
+				targetNode = curr.Node
+			}
+
+			if targetNode != nil {
+				if m.state.IsConnected && m.state.ActiveNode != nil && m.state.ActiveNode.ID == targetNode.ID {
+					_ = m.engine.Stop()
+					m.state.IsConnected = false
+					m.statusMessage = "Disconnected."
+					m.statusIsError = false
+				} else {
+					m.state.ActiveNode = targetNode
+					m.statusMessage = fmt.Sprintf("Connecting to %s...", targetNode.Name)
+					m.statusIsError = false
+					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+
+					return m, func() tea.Msg {
+						err := m.engine.Start(targetNode, m.procMgr.GetBypassNamesList(), m.state.GeoRules)
+						return connectResultMsg{err: err}
+					}
 				}
 			}
 		}
 
 	case "t", "T":
 		var cmds []tea.Cmd
-		for _, n := range nodes {
-			node := n
-			cmds = append(cmds, func() tea.Msg {
-				ms := subscription.PingNode(node, 2*time.Second)
-				return pingResultMsg{node: node, ping: ms}
-			})
+		for _, it := range items {
+			if !it.IsHeader && it.Node != nil {
+				node := it.Node
+				cmds = append(cmds, func() tea.Msg {
+					ms := subscription.PingNode(node, 2*time.Second)
+					return pingResultMsg{node: node, ping: ms}
+				})
+			}
 		}
 		return m, tea.Batch(cmds...)
 
@@ -1647,29 +1756,42 @@ func (m *Model) overlayQuitConfirm(raw string) string {
 	msg1 := lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Bold(true).Render("  Are you sure you want to quit signbox-cli?")
 	innerLines = append(innerLines, padLine(msg1, innerW))
 
+	bracketStyle := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg)
+	textStyle := lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg)
+	mutedTextStyle := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg)
+
 	if m.state.IsConnected {
 		msg2 := lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Bold(true).Render("  ● VPN tunnel is currently ACTIVE.")
-		msg3 := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("  Leave VPN running in background or disconnect?")
+		msg3 := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("  Choose how you want to exit:")
 		innerLines = append(innerLines, padLine(msg2, innerW))
 		innerLines = append(innerLines, padLine(msg3, innerW))
 		innerLines = append(innerLines, emptyBlackLine(innerW))
 
-		btnKeep := lipgloss.NewStyle().Background(ColorSuccess).Foreground(ColorBg).Bold(true).Render(" [Enter/y] Keep in Background ")
-		btnDisc := lipgloss.NewStyle().Background(ColorDanger).Foreground(ColorWhite).Bold(true).Render(" [d] Disconnect & Exit ")
-		btnCancel := lipgloss.NewStyle().Background(ColorSelection).Foreground(ColorWhite).Bold(true).Render(" [Esc] Cancel ")
-		btnLine1 := fmt.Sprintf("  %s", btnKeep)
-		btnLine2 := fmt.Sprintf("  %s   %s", btnDisc, btnCancel)
-		innerLines = append(innerLines, padLine(btnLine1, innerW))
-		innerLines = append(innerLines, padLine(btnLine2, innerW))
+		opt1Key := bracketStyle.Render("  [") + lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Bold(true).Render("Enter") + bracketStyle.Render("/") + lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Bold(true).Render("y") + bracketStyle.Render("]")
+		opt1 := opt1Key + textStyle.Render("  Keep VPN in background & exit")
+
+		opt2Key := bracketStyle.Render("  [   ") + lipgloss.NewStyle().Foreground(ColorDanger).Background(ColorBg).Bold(true).Render("d") + bracketStyle.Render("   ]")
+		opt2 := opt2Key + textStyle.Render("  Disconnect VPN and exit cleanly")
+
+		opt3Key := bracketStyle.Render("  [  ") + mutedTextStyle.Render("Esc") + bracketStyle.Render("  ]")
+		opt3 := opt3Key + mutedTextStyle.Render("  Cancel (stay in sb-cli)")
+
+		innerLines = append(innerLines, padLine(opt1, innerW))
+		innerLines = append(innerLines, padLine(opt2, innerW))
+		innerLines = append(innerLines, padLine(opt3, innerW))
 	} else {
 		msg2 := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("  All background processes will be terminated cleanly.")
 		innerLines = append(innerLines, padLine(msg2, innerW))
 		innerLines = append(innerLines, emptyBlackLine(innerW))
 
-		btnQuit := lipgloss.NewStyle().Background(ColorDanger).Foreground(ColorWhite).Bold(true).Render(" [y/Enter] Quit ")
-		btnCancel := lipgloss.NewStyle().Background(ColorSelection).Foreground(ColorWhite).Bold(true).Render(" [n/Esc] Cancel ")
-		btnLine := fmt.Sprintf("      %s      %s", btnQuit, btnCancel)
-		innerLines = append(innerLines, padLine(btnLine, innerW))
+		opt1Key := bracketStyle.Render("  [") + lipgloss.NewStyle().Foreground(ColorPrimary).Background(ColorBg).Bold(true).Render("Enter") + bracketStyle.Render("/") + lipgloss.NewStyle().Foreground(ColorPrimary).Background(ColorBg).Bold(true).Render("y") + bracketStyle.Render("]")
+		opt1 := opt1Key + textStyle.Render("  Confirm quit")
+
+		opt2Key := bracketStyle.Render("  [  ") + mutedTextStyle.Render("Esc") + bracketStyle.Render("  ]")
+		opt2 := opt2Key + mutedTextStyle.Render("  Cancel")
+
+		innerLines = append(innerLines, padLine(opt1, innerW))
+		innerLines = append(innerLines, padLine(opt2, innerW))
 	}
 	innerLines = append(innerLines, emptyBlackLine(innerW))
 
@@ -1797,8 +1919,15 @@ func (m *Model) renderTopBar() string {
 
 	statusStr := StyleDanger.Render("● DISCONNECTED")
 	if m.state.IsConnected {
-		uptime := time.Since(m.state.ConnectedAt).Truncate(time.Second)
-		statusStr = StyleSuccess.Render(fmt.Sprintf("● CONNECTED (%s)", uptime.String()))
+		if m.state.ConnectedAt.IsZero() || time.Since(m.state.ConnectedAt) > 365*24*time.Hour || time.Since(m.state.ConnectedAt) < 0 {
+			if m.engine != nil {
+				m.state.ConnectedAt = m.engine.GetConnectedAt()
+			} else {
+				m.state.ConnectedAt = time.Now()
+			}
+		}
+		uptime := formatUptime(time.Since(m.state.ConnectedAt))
+		statusStr = StyleSuccess.Render(fmt.Sprintf("● CONNECTED (%s)", uptime))
 	}
 
 	statusBanner := ""

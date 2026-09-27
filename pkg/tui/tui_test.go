@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"signbox-cli/pkg/core"
 	"signbox-cli/pkg/model"
@@ -720,6 +721,121 @@ func TestNodeSelectionAndScrolling(t *testing.T) {
 		t.Fatalf("expected nodeScrollOffset to return to %d, got %d", initialScroll, m.nodeScrollOffset)
 	}
 }
+
+func TestSubscriptionCollapseAndExpand(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewMain
+
+	// 2 subscriptions
+	sub1 := &model.Subscription{
+		ID:   "sub-alpha",
+		Name: "Alpha VPN",
+		Nodes: []*model.ProxyNode{
+			{ID: "n1", Name: "Node 1", Protocol: "vless"},
+			{ID: "n2", Name: "Node 2", Protocol: "vless"},
+		},
+	}
+	sub2 := &model.Subscription{
+		ID:   "sub-beta",
+		Name: "Beta VPN",
+		Nodes: []*model.ProxyNode{
+			{ID: "n3", Name: "Node 3", Protocol: "vless"},
+		},
+	}
+	m.state.Subscriptions = []*model.Subscription{sub1, sub2}
+	m.clampNodeState()
+
+	// Initial items: 2 headers + 3 nodes = 5 items total
+	items := m.getServerListItems()
+	if len(items) != 5 {
+		t.Fatalf("expected 5 items initially, got %d", len(items))
+	}
+	if !items[0].IsHeader || items[0].Sub.ID != "sub-alpha" {
+		t.Fatalf("expected first item to be header of sub-alpha")
+	}
+
+	// 1. Cursor is on index 0 (sub-alpha header) -> press 'e' to collapse
+	m.selectedNodeIdx = 0
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if !m.collapsedSubs["sub-alpha"] {
+		t.Fatalf("expected sub-alpha to be collapsed")
+	}
+	// After collapse: 1 header (sub-alpha) + 1 header (sub-beta) + 1 node (sub-beta) = 3 items total
+	itemsAfter := m.getServerListItems()
+	if len(itemsAfter) != 3 {
+		t.Fatalf("expected 3 items after collapsing sub-alpha, got %d", len(itemsAfter))
+	}
+
+	// 2. Press 'e' on sub-alpha header again -> expands back to 5 items
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if m.collapsedSubs["sub-alpha"] {
+		t.Fatalf("expected sub-alpha to be expanded")
+	}
+	if len(m.getServerListItems()) != 5 {
+		t.Fatalf("expected 5 items after expanding sub-alpha, got %d", len(m.getServerListItems()))
+	}
+
+	// 3. Move cursor to node inside sub-alpha (index 1) -> press Russian 'у' ('e')
+	m.selectedNodeIdx = 1
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'у'}})
+	if !m.collapsedSubs["sub-alpha"] {
+		t.Fatalf("expected sub-alpha to collapse from inside a node using Russian 'у'")
+	}
+	// Cursor should have jumped to the sub-alpha header (index 0)
+	if m.selectedNodeIdx != 0 {
+		t.Fatalf("expected cursor to jump to header (0), got %d", m.selectedNodeIdx)
+	}
+
+	// 4. Shift+E ('E') -> collapse all / expand all toggle
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+	// All should now be collapsed: 2 items total (2 headers)
+	itemsCollapsedAll := m.getServerListItems()
+	if len(itemsCollapsedAll) != 2 {
+		t.Fatalf("expected 2 headers when all collapsed, got %d", len(itemsCollapsedAll))
+	}
+
+	// Shift+E again -> expands all
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+	itemsExpandedAll := m.getServerListItems()
+	if len(itemsExpandedAll) != 5 {
+		t.Fatalf("expected 5 items when all expanded, got %d", len(itemsExpandedAll))
+	}
+}
+
+func TestUptimeFormattingAndReconnection(t *testing.T) {
+	// 1. Test formatUptime
+	if s := formatUptime(45 * time.Second); s != "00m 45s" {
+		t.Fatalf("expected '00m 45s', got %q", s)
+	}
+	if s := formatUptime(15*time.Minute + 30*time.Second); s != "15m 30s" {
+		t.Fatalf("expected '15m 30s', got %q", s)
+	}
+	if s := formatUptime(2*time.Hour + 10*time.Minute + 5*time.Second); s != "02h 10m 05s" {
+		t.Fatalf("expected '02h 10m 05s', got %q", s)
+	}
+	if s := formatUptime(-5 * time.Second); s != "00m 00s" {
+		t.Fatalf("expected negative to clamp to '00m 00s', got %q", s)
+	}
+
+	// 2. Test GetConnectedAt does not return zero time
+	m := createTestModel()
+	connAt := m.engine.GetConnectedAt()
+	if connAt.IsZero() {
+		t.Fatalf("expected GetConnectedAt to not be zero")
+	}
+
+	// 3. Test that renderTopBar recovers a zero ConnectedAt
+	m.state.IsConnected = true
+	m.state.ConnectedAt = time.Time{} // zero time bug scenario
+	_ = m.renderTopBar()
+	if m.state.ConnectedAt.IsZero() {
+		t.Fatalf("expected ConnectedAt to be recovered, but remained zero")
+	}
+	if time.Since(m.state.ConnectedAt) > 24*time.Hour {
+		t.Fatalf("expected sane ConnectedAt, got %v", m.state.ConnectedAt)
+	}
+}
+
 
 
 

@@ -11,6 +11,15 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+// ServerListItem represents either a subscription folder/header or an individual node row
+type ServerListItem struct {
+	IsHeader  bool
+	Sub       *model.Subscription
+	Node      *model.ProxyNode
+	NodeCount int
+	Collapsed bool
+}
+
 // RenderMainView renders the main dashboard (Happ structure + btop aesthetics)
 func (m *Model) RenderMainView() string {
 	width := m.width
@@ -65,17 +74,22 @@ func (m *Model) renderServersPanel(width, height int) string {
 
 	var innerLines []string
 
-	nodes := m.getFilteredNodes()
-	totalItems := len(nodes)
+	items := m.getServerListItems()
+	totalItems := len(items)
 
 	// Subheader info: Show current group & traffic if selected, or filter/add hint
-	subHeaderStr := "  [F] Filter  [A] Add Subscription/Node"
+	subHeaderStr := "  [F] Filter  [A] Add  [E] Collapse All"
 	if totalItems > 0 && m.selectedNodeIdx < totalItems {
-		currNode := nodes[m.selectedNodeIdx]
-		if sub := m.findSubscription(currNode.Group); sub != nil {
-			subHeaderStr = fmt.Sprintf("  ▼ [%s] %s  [F] Filter", sub.Name, sub.FormatTraffic())
-		} else if currNode.Group != "" {
-			subHeaderStr = fmt.Sprintf("  ▼ [%s]  [F] Filter", currNode.Group)
+		currItem := items[m.selectedNodeIdx]
+		if currItem.IsHeader {
+			trafficStr := currItem.Sub.FormatTraffic()
+			if currItem.Collapsed {
+				subHeaderStr = fmt.Sprintf("  ▶ [%s] %s  [Enter/Space/e] Expand", currItem.Sub.Name, trafficStr)
+			} else {
+				subHeaderStr = fmt.Sprintf("  ▼ [%s] %s  [Enter/Space/e] Collapse", currItem.Sub.Name, trafficStr)
+			}
+		} else if currItem.Sub != nil {
+			subHeaderStr = fmt.Sprintf("  ▼ [%s] %s  [Enter] Connect  [e] Collapse", currItem.Sub.Name, currItem.Sub.FormatTraffic())
 		}
 	}
 	if lipgloss.Width(subHeaderStr) > innerWidth {
@@ -138,9 +152,13 @@ func (m *Model) renderServersPanel(width, height int) string {
 
 		var rowStr string
 		if itemIdx < totalItems {
-			node := nodes[itemIdx]
+			item := items[itemIdx]
 			isSelected := (itemIdx == m.selectedNodeIdx)
-			rowStr = m.formatNodeRow(node, itemIdx, m.selectedNodeIdx, rowWidth, isSelected)
+			if item.IsHeader {
+				rowStr = m.formatHeaderRow(item, rowWidth, isSelected)
+			} else {
+				rowStr = m.formatNodeRow(item.Node, itemIdx, m.selectedNodeIdx, rowWidth, isSelected)
+			}
 		} else {
 			if totalItems == 0 && r == 0 {
 				rowStr = lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(fmt.Sprintf("%-*s", rowWidth, "  No servers. Press [a] to add."))
@@ -186,6 +204,40 @@ func (m *Model) renderServersPanel(width, height int) string {
 	return strings.Join(allLines, "\n")
 }
 
+func (m *Model) formatHeaderRow(item ServerListItem, width int, isSelected bool) string {
+	icon := "▼"
+	statusTag := ""
+	if item.Collapsed {
+		icon = "▶"
+		statusTag = " [collapsed]"
+	}
+
+	countStr := fmt.Sprintf("(%d)", item.NodeCount)
+	trafficStr := item.Sub.FormatTraffic()
+
+	title := fmt.Sprintf(" %s [%s] %s%s", icon, item.Sub.Name, countStr, statusTag)
+	titleW := lipgloss.Width(title)
+	trafW := lipgloss.Width(trafficStr)
+
+	slack := width - titleW - trafW - 2
+	if slack < 1 {
+		slack = 1
+	}
+
+	if isSelected {
+		selBg := ColorSelection
+		sTitle := lipgloss.NewStyle().Foreground(ColorSecondary).Background(selBg).Bold(true).Render(title)
+		sSlack := lipgloss.NewStyle().Background(selBg).Render(strings.Repeat(" ", slack))
+		sTraf := lipgloss.NewStyle().Foreground(ColorWhite).Background(selBg).Render(trafficStr + " ")
+		return sTitle + sSlack + sTraf
+	}
+
+	sTitle := lipgloss.NewStyle().Foreground(ColorSecondary).Background(ColorBg).Bold(true).Render(title)
+	sSlack := lipgloss.NewStyle().Background(ColorBg).Render(strings.Repeat(" ", slack))
+	sTraf := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(trafficStr + " ")
+	return sTitle + sSlack + sTraf
+}
+
 func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width int, isSelected bool) string {
 	isActive := (m.state.ActiveNode != nil && m.state.ActiveNode.ID == node.ID)
 
@@ -202,9 +254,12 @@ func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width i
 	}
 	markerW := lipgloss.Width(markerStr)
 
-	// Available width for node name: width - (markerW + 1 + 1 + protoW + 1 + pingW)
+	indentStr := "   "
+	indentW := lipgloss.Width(indentStr)
+
+	// Available width for node name: width - (indentW + markerW + 1 + 1 + protoW + 1 + pingW)
 	rightMetaW := protoW + 1 + pingW
-	availNameW := width - markerW - 2 - rightMetaW
+	availNameW := width - indentW - markerW - 2 - rightMetaW
 	if availNameW < 6 {
 		availNameW = 6
 	}
@@ -221,6 +276,7 @@ func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width i
 
 	if isSelected {
 		selBg := ColorSelection
+		sIndent := lipgloss.NewStyle().Background(selBg).Render(indentStr)
 		sMarker := lipgloss.NewStyle().Foreground(ColorWhite).Background(selBg).Bold(true).Render(markerStr)
 		if isActive {
 			sMarker = lipgloss.NewStyle().Foreground(ColorSuccess).Background(selBg).Bold(true).Render("●")
@@ -240,13 +296,14 @@ func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width i
 		sPing := pingStyle.Render(fmt.Sprintf("%*s", pingW, pingStr))
 		sp := lipgloss.NewStyle().Background(selBg).Render(" ")
 
-		return sp + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
+		return sIndent + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
 	}
 
 	// Unselected row: distance gradient on node name (same as btop proc_view)
 	dist := Abs(cursorIdx - itemIdx)
 	procGreenColor := lipgloss.Color(GetGreenGradient(dist))
 
+	sIndent := lipgloss.NewStyle().Background(ColorBg).Render(indentStr)
 	sMarker := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(markerStr)
 	if isActive {
 		sMarker = lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Bold(true).Render("●")
@@ -271,7 +328,7 @@ func (m *Model) formatNodeRow(node *model.ProxyNode, itemIdx, cursorIdx, width i
 	sPing := pingStyle.Render(fmt.Sprintf("%*s", pingW, pingStr))
 	sp := lipgloss.NewStyle().Background(ColorBg).Render(" ")
 
-	return sp + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
+	return sIndent + sMarker + sp + sName + sSlack + sp + sProto + sp + sPing
 }
 
 func (m *Model) renderDashboardPanel(width, height int) string {
@@ -297,10 +354,25 @@ func (m *Model) renderDashboardPanel(width, height int) string {
 
 	// Big status button (Happ style)
 	if m.state.IsConnected {
-		uptime := time.Since(m.state.ConnectedAt).Truncate(time.Second)
+		if m.state.ConnectedAt.IsZero() || time.Since(m.state.ConnectedAt) > 365*24*time.Hour || time.Since(m.state.ConnectedAt) < 0 {
+			if m.engine != nil {
+				m.state.ConnectedAt = m.engine.GetConnectedAt()
+			} else {
+				m.state.ConnectedAt = time.Now()
+			}
+		}
+		uptime := formatUptime(time.Since(m.state.ConnectedAt))
+		uptPad := (24 - lipgloss.Width(uptime)) / 2
+		if uptPad < 0 {
+			uptPad = 0
+		}
+		uptSlack := 24 - lipgloss.Width(uptime) - uptPad
+		if uptSlack < 0 {
+			uptSlack = 0
+		}
 		b1 := StyleSuccess.Copy().Background(ColorBg).Bold(true).Render("  ╭────────────────────────╮")
 		b2 := StyleSuccess.Copy().Background(ColorBg).Bold(true).Render("  │      ● CONNECTED       │")
-		b3 := StyleSuccess.Copy().Background(ColorBg).Bold(true).Render(fmt.Sprintf("  │        %-14s  │", uptime.String()))
+		b3 := StyleSuccess.Copy().Background(ColorBg).Bold(true).Render(fmt.Sprintf("  │%s%s%s│", strings.Repeat(" ", uptPad), uptime, strings.Repeat(" ", uptSlack)))
 		b4 := StyleSuccess.Copy().Background(ColorBg).Bold(true).Render("  ╰────────────────────────╯")
 		innerLines = append(innerLines, padLine(b1, innerWidth), padLine(b2, innerWidth), padLine(b3, innerWidth), padLine(b4, innerWidth))
 	} else {
@@ -447,4 +519,54 @@ func (m *Model) findSubscription(group string) *model.Subscription {
 		}
 	}
 	return nil
+}
+
+func (m *Model) getServerListItems() []ServerListItem {
+	var items []ServerListItem
+	query := strings.ToLower(strings.TrimSpace(m.mainFilterQuery))
+
+	for _, sub := range m.state.Subscriptions {
+		if sub == nil {
+			continue
+		}
+		var matchingNodes []*model.ProxyNode
+		for _, n := range sub.Nodes {
+			if n == nil {
+				continue
+			}
+			if query == "" || strings.Contains(strings.ToLower(n.Name), query) || strings.Contains(strings.ToLower(n.Protocol), query) {
+				matchingNodes = append(matchingNodes, n)
+			}
+		}
+
+		if query != "" && len(matchingNodes) == 0 {
+			continue
+		}
+
+		isCollapsed := false
+		if m.collapsedSubs != nil {
+			isCollapsed = m.collapsedSubs[sub.ID]
+		}
+		if query != "" {
+			isCollapsed = false
+		}
+
+		items = append(items, ServerListItem{
+			IsHeader:  true,
+			Sub:       sub,
+			NodeCount: len(sub.Nodes),
+			Collapsed: isCollapsed,
+		})
+
+		if !isCollapsed {
+			for _, n := range matchingNodes {
+				items = append(items, ServerListItem{
+					IsHeader: false,
+					Sub:      sub,
+					Node:     n,
+				})
+			}
+		}
+	}
+	return items
 }

@@ -29,13 +29,14 @@ type Engine struct {
 	xrayLogPath string
 	sbLogPath   string
 	xrayPidPath string
-	sbPidPath   string
-	isRunning   bool
-	HasTunCap   bool
-	activeNode  *model.ProxyNode
-	bypassList  []string
-	geoRules    []*model.GeoRule
-	geoMgr      *geo.Manager
+	sbPidPath       string
+	connectedAtPath string
+	isRunning       bool
+	HasTunCap       bool
+	activeNode      *model.ProxyNode
+	bypassList      []string
+	geoRules        []*model.GeoRule
+	geoMgr          *geo.Manager
 }
 
 // NewEngine creates an Engine instance
@@ -60,16 +61,17 @@ func NewEngine() *Engine {
 	_ = os.MkdirAll(tmpDir, 0755)
 
 	return &Engine{
-		xrayBin:     xrayPath,
-		singboxBin:  sbPath,
-		xrayCfgPath: filepath.Join(tmpDir, "xray.json"),
-		sbCfgPath:   filepath.Join(tmpDir, "sing-box.json"),
-		xrayLogPath: filepath.Join(tmpDir, "xray.log"),
-		sbLogPath:   filepath.Join(tmpDir, "sing-box.log"),
-		xrayPidPath: filepath.Join(tmpDir, "xray.pid"),
-		sbPidPath:   filepath.Join(tmpDir, "singbox.pid"),
-		isRunning:   false,
-		geoMgr:      geo.NewManager(),
+		xrayBin:         xrayPath,
+		singboxBin:      sbPath,
+		xrayCfgPath:     filepath.Join(tmpDir, "xray.json"),
+		sbCfgPath:       filepath.Join(tmpDir, "sing-box.json"),
+		xrayLogPath:     filepath.Join(tmpDir, "xray.log"),
+		sbLogPath:       filepath.Join(tmpDir, "sing-box.log"),
+		xrayPidPath:     filepath.Join(tmpDir, "xray.pid"),
+		sbPidPath:       filepath.Join(tmpDir, "singbox.pid"),
+		connectedAtPath: filepath.Join(tmpDir, "connected_at"),
+		isRunning:       false,
+		geoMgr:          geo.NewManager(),
 	}
 }
 
@@ -111,6 +113,28 @@ func (e *Engine) IsRunning() bool {
 	}
 
 	return false
+}
+
+// GetConnectedAt returns the timestamp when the current VPN session started
+func (e *Engine) GetConnectedAt() time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 1. Try reading from connected_at file
+	if data, err := os.ReadFile(e.connectedAtPath); err == nil {
+		if sec, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil && sec > 1577836800 {
+			return time.Unix(sec, 0)
+		}
+	}
+
+	// 2. Try file modification time of singbox.pid
+	if fi, err := os.Stat(e.sbPidPath); err == nil {
+		if fi.ModTime().Year() > 2020 {
+			return fi.ModTime()
+		}
+	}
+
+	return time.Now()
 }
 
 // Start connects to the target node
@@ -265,6 +289,7 @@ func (e *Engine) stopLocked() {
 	waitForTunReleased(1 * time.Second)
 	_ = os.Remove(e.xrayPidPath)
 	_ = os.Remove(e.sbPidPath)
+	_ = os.Remove(e.connectedAtPath)
 	e.isRunning = false
 }
 
@@ -359,6 +384,7 @@ func (e *Engine) startSingboxTUN(node *model.ProxyNode, bypassList []string, geo
 		return fmt.Errorf("sing-box tun exited: %s", strings.TrimSpace(string(logContent)))
 	}
 
+	_ = os.WriteFile(e.connectedAtPath, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0644)
 	return nil
 }
 

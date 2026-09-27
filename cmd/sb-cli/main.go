@@ -87,6 +87,7 @@ func main() {
 	// Check if background VPN is already running
 	if engine.IsRunning() {
 		state.IsConnected = true
+		state.ConnectedAt = engine.GetConnectedAt()
 	}
 
 	var bypassList []string
