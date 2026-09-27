@@ -121,6 +121,40 @@ func TestGenerateSingboxConfig(t *testing.T) {
 		t.Errorf("expected 198.51.100.1/32 in route_exclude_address, got %v", excludes)
 	}
 
+	// Verify strict_route is false and stack is mixed for P2P gaming support
+	if strictRoute, ok := tunIn["strict_route"].(bool); !ok || strictRoute {
+		t.Errorf("expected strict_route: false in tunInbound for P2P games, got %v", tunIn["strict_route"])
+	}
+	if stack, ok := tunIn["stack"].(string); !ok || stack != "mixed" {
+		t.Errorf("expected stack: 'mixed' in tunInbound, got %v", tunIn["stack"])
+	}
+
+	// Verify process_path_regex is present for bypassed Wine/Proton games
+	foundPathRegex := false
+	foundSteamUDP := false
+	for _, r := range rules {
+		if rMap, ok := r.(map[string]interface{}); ok {
+			if _, ok := rMap["process_path_regex"]; ok && rMap["outbound"] == "direct" {
+				foundPathRegex = true
+			}
+			if rMap["outbound"] == "direct" {
+				if portRanges, ok := rMap["port_range"].([]interface{}); ok {
+					for _, pr := range portRanges {
+						if prStr, ok := pr.(string); ok && prStr == "27000:27100" {
+							foundSteamUDP = true
+						}
+					}
+				}
+			}
+		}
+	}
+	if !foundPathRegex {
+		t.Errorf("expected process_path_regex rule for bypassed Wine/Proton game")
+	}
+	if !foundSteamUDP {
+		t.Errorf("expected Steam UDP ports direct rule in rules")
+	}
+
 	// 4. Verify outbounds direct and ensure no bind_interface pointing to tun
 	outbounds, ok := cfg["outbounds"].([]interface{})
 	if !ok || len(outbounds) < 2 {

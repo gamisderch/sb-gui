@@ -144,8 +144,15 @@ func (pm *ProcessManager) GetBypassNamesList() []string {
 				seen[trimmed[:15]] = true
 			}
 		}
-		if strings.Contains(lower, "wine") || strings.Contains(lower, "preloader") || strings.Contains(lower, "fsd") {
+		if strings.Contains(lower, "wine") || strings.Contains(lower, "preloader") || strings.Contains(lower, "proton") || strings.Contains(lower, "fsd") {
 			hasWineProcess = true
+		}
+		if strings.Contains(lower, "fsd") {
+			seen["FSD"] = true
+			seen["FSD.exe"] = true
+			seen["FSD-Win64-Shipping.exe"] = true
+			seen["FSD-Win64-Shipping"] = true
+			seen["FSD-Win64-Shipp"] = true
 		}
 		if strings.Contains(lower, "steam") {
 			seen["steamwebhelper"] = true
@@ -153,19 +160,30 @@ func (pm *ProcessManager) GetBypassNamesList() []string {
 			seen["steam_osx"] = true
 			seen["steam_linux"] = true
 		}
+		if len(trimmed) > 15 {
+			seen[trimmed[:15]] = true
+		}
 	}
 
-	// If any Windows / Wine process is bypassed, ensure Wine and Proton socket wrappers are bypassed
+	// If any Windows / Wine / Proton process is bypassed, ensure Wine and Proton socket wrappers are bypassed
 	if hasWineProcess {
 		seen["wine64-preloader"] = true
 		seen["wine-preloader"] = true
 		seen["wineserver"] = true
 		seen["wine"] = true
 		seen["winedevice.exe"] = true
+		seen["winedevice"] = true
 		seen["pv-adverb"] = true
+		seen["pressure-vessel-adverb"] = true
 		seen["srt-bwrap"] = true
+		seen["bwrap"] = true
 		seen["steamwebhelper"] = true
 		seen["steam"] = true
+		seen["reaper"] = true
+		seen["gameoverlayui"] = true
+		seen["xalia.exe"] = true
+		seen["xalia"] = true
+		seen["proton"] = true
 	}
 
 	var list []string

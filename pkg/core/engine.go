@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -699,21 +700,81 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 	// Prepare route rules in strict priority order
 	var rules []map[string]interface{}
 
+	hasWineProcess := false
+	for _, bp := range bypassList {
+		lower := strings.ToLower(bp)
+		if strings.HasSuffix(lower, ".exe") || strings.Contains(lower, "wine") || strings.Contains(lower, "proton") || strings.Contains(lower, "fsd") {
+			hasWineProcess = true
+			break
+		}
+	}
+
 	// 1. Selective Split Tunneling: Bypassed processes (Right column) go 100% direct!
 	if len(bypassList) > 0 {
 		rules = append(rules, map[string]interface{}{
 			"process_name": bypassList,
 			"outbound":     "direct",
 		})
+
+		// If Wine/Proton/Steam games are in bypass, add process_path_regex to match
+		// any socket path created by Wine prefixes, Proton, Steam Linux Runtime, or game folders
+		if hasWineProcess {
+			var wineRegexes []string
+			wineRegexes = append(wineRegexes,
+				`.*[/\\].*wine.*`,
+				`.*[/\\].*proton.*`,
+				`.*[/\\].*pressure-vessel.*`,
+				`.*[/\\].*bwrap.*`,
+			)
+			for _, bp := range bypassList {
+				lower := strings.ToLower(bp)
+				if strings.HasSuffix(lower, ".exe") || strings.Contains(lower, "fsd") {
+					base := strings.TrimSuffix(bp, filepath.Ext(bp))
+					if len(base) > 0 {
+						wineRegexes = append(wineRegexes, fmt.Sprintf(`.*[/\\].*%s.*`, regexp.QuoteMeta(base)))
+					}
+				}
+			}
+			rules = append(rules, map[string]interface{}{
+				"process_path_regex": wineRegexes,
+				"outbound":           "direct",
+			})
+		}
 	}
 
-	// 2. Sing-box, Xray, and sb-cli self-traffic safety direct rule
+	// 2. Steam P2P, Voice, SDR relay, and Game UDP ports go DIRECT ONLY if Wine/Proton games are bypassed!
+	// This fixes P2P multiplayer games (like Deep Rock Galactic, Risk of Rain, etc.)
+	// whose unconnected UDP sockets (bound to 0.0.0.0:*) cannot be matched by Netlink socket-diag.
+	// If the user leaves the game in the VPN column, these ports are NOT forced to direct,
+	// allowing the game's P2P and relay traffic to flow through the VPN tunnel.
+	if hasWineProcess {
+		rules = append(rules, map[string]interface{}{
+			"port": []int{3478},
+			"port_range": []string{
+				"4379:4380",
+				"27000:27100",
+			},
+			"network":  []string{"udp"},
+			"outbound": "direct",
+		})
+		rules = append(rules, map[string]interface{}{
+			"source_port": []int{3478},
+			"source_port_range": []string{
+				"4379:4380",
+				"27000:27100",
+			},
+			"network":  []string{"udp"},
+			"outbound": "direct",
+		})
+	}
+
+	// 3. Sing-box, Xray, and sb-cli self-traffic safety direct rule
 	rules = append(rules, map[string]interface{}{
 		"process_name": []string{"sing-box", "xray", "sb-cli"},
 		"outbound":     "direct",
 	})
 
-	// 3. Direct route for the proxy server itself to prevent routing loops
+	// 4. Direct route for the proxy server itself to prevent routing loops
 	if len(excludeAddrs) > 0 {
 		rules = append(rules, map[string]interface{}{
 			"ip_cidr":  excludeAddrs,
@@ -721,13 +782,13 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 		})
 	}
 
-	// 4. Direct route for private IP ranges (LAN, localhost)
+	// 5. Direct route for private IP ranges (LAN, localhost)
 	rules = append(rules, map[string]interface{}{
 		"ip_is_private": true,
 		"outbound":      "direct",
 	})
 
-	// 5. Geo Rules: Block rules (highest priority among geo rules, e.g. ads/trackers/malware)
+	// 6. Geo Rules: Block rules (highest priority among geo rules, e.g. ads/trackers/malware)
 	if len(blockRuleSets) > 0 {
 		rules = append(rules, map[string]interface{}{
 			"rule_set": blockRuleSets,
@@ -735,7 +796,7 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 		})
 	}
 
-	// 6. Geo Rules: Direct rules (e.g. ru domains, ru geoip)
+	// 7. Geo Rules: Direct rules (e.g. ru domains, ru geoip)
 	if len(directRuleSets) > 0 {
 		rules = append(rules, map[string]interface{}{
 			"rule_set": directRuleSets,
@@ -743,7 +804,7 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 		})
 	}
 
-	// 7. Geo Rules: Proxy rules (e.g. youtube, telegram, discord)
+	// 8. Geo Rules: Proxy rules (e.g. youtube, telegram, discord)
 	if len(proxyRuleSets) > 0 {
 		rules = append(rules, map[string]interface{}{
 			"rule_set": proxyRuleSets,
@@ -751,13 +812,13 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 		})
 	}
 
-	// 8. Hijack port 53 DNS queries to internal DoH for all remaining VPN traffic
+	// 9. Hijack port 53 DNS queries to internal DoH for all remaining VPN traffic
 	rules = append(rules, map[string]interface{}{
 		"port":   53,
 		"action": "hijack-dns",
 	})
 
-	// 9. Default rule: all other TUN traffic goes through the VPN proxy (Left column)
+	// 10. Default rule: all other TUN traffic goes through the VPN proxy (Left column)
 	rules = append(rules, map[string]interface{}{
 		"inbound":  []string{"tun-in"},
 		"outbound": "proxy",
@@ -770,9 +831,9 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 		"address":                  []string{"172.16.250.1/30"},
 		"mtu":                      1360,
 		"auto_route":               true,
-		"strict_route":             true,
+		"strict_route":             false,
 		"endpoint_independent_nat": true,
-		"stack":                    "gvisor",
+		"stack":                    "mixed",
 	}
 	if len(excludeAddrs) > 0 {
 		tunInbound["route_exclude_address"] = excludeAddrs
