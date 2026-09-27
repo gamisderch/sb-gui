@@ -44,6 +44,10 @@ func main() {
 			IsConnected:   false,
 			ThemeColors:   cfg.ThemeColors,
 			GeoRules:      cfg.GeoRules,
+			IPType:        cfg.IPType,
+			Fragmentation: cfg.Fragmentation,
+			Mux:           cfg.Mux,
+			Advanced:      cfg.Advanced,
 		}
 		if cfg.ThemeColors != nil {
 			tui.ApplyThemeColors(cfg.ThemeColors)
@@ -54,7 +58,19 @@ func main() {
 		}
 
 		// Restore active node and ensure node details are fresh from raw_uri
+		hasNewRules := false
 		for _, sub := range state.Subscriptions {
+			if len(sub.GeoRules) == 0 {
+				for _, n := range sub.Nodes {
+					if rawJSON, ok := n.Details["raw_json"]; ok && rawJSON != "" {
+						if rules := subscription.ParseJSONRules(rawJSON); len(rules) > 0 {
+							sub.GeoRules = rules
+							hasNewRules = true
+							break
+						}
+					}
+				}
+			}
 			for _, n := range sub.Nodes {
 				if n.RawURI != "" {
 					if reParsed, err := subscription.ParseNodeURI(n.RawURI, sub.Name); err == nil {
@@ -69,6 +85,9 @@ func main() {
 				}
 			}
 		}
+		if hasNewRules {
+			_ = core.SaveConfig(state, procMgr.BypassNames)
+		}
 	}
 
 	// Clean initial state with NO fake subscriptions
@@ -78,6 +97,10 @@ func main() {
 			IsConnected:   false,
 			UserAgent:     subscription.DefaultUserAgent,
 			Subscriptions: nil,
+			IPType:        model.IPTypePreferIPv4,
+			Fragmentation: model.DefaultFragmentationConfig(),
+			Mux:           model.DefaultMuxConfig(),
+			Advanced:      model.DefaultAdvancedTunnelConfig(),
 		}
 	}
 
@@ -115,8 +138,9 @@ func main() {
 			core.LogDaemon("Starting VPN tunnel to %s (%s:%d)...", state.ActiveNode.Name, state.ActiveNode.Address, state.ActiveNode.Port)
 			fmt.Printf("Starting VPN tunnel to %s (%s:%d)...\n", state.ActiveNode.Name, state.ActiveNode.Address, state.ActiveNode.Port)
 			var startErr error
+			effectiveRules := model.ResolveGeoRules(state.ActiveNode, state.Subscriptions, state.GeoRules)
 			for attempt := 1; attempt <= 3; attempt++ {
-				startErr = engine.Start(state.ActiveNode, bypassList, state.GeoRules)
+				startErr = engine.Start(state.ActiveNode, bypassList, effectiveRules)
 				if startErr == nil {
 					break
 				}

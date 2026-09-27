@@ -139,7 +139,7 @@ func (f *Fetcher) FetchSubscription(subURL, subName string) (*model.Subscription
 		return nil, fmt.Errorf("failed to read subscription response: %w", err)
 	}
 
-	nodes, err := ParseContent(string(bodyBytes), sub.Name)
+	nodes, rules, err := ParseContentWithRules(string(bodyBytes), sub.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +149,7 @@ func (f *Fetcher) FetchSubscription(subURL, subName string) (*model.Subscription
 	}
 
 	sub.Nodes = nodes
+	sub.GeoRules = rules
 	return sub, nil
 }
 
@@ -175,9 +176,15 @@ func parseUserInfo(header string, sub *model.Subscription) {
 
 // ParseContent parses raw subscription content supporting JSON, Clash YAML, Base64, and URI lines.
 func ParseContent(content, groupName string) ([]*model.ProxyNode, error) {
+	nodes, _, err := ParseContentWithRules(content, groupName)
+	return nodes, err
+}
+
+// ParseContentWithRules parses raw subscription content and extracts both proxy nodes and GeoSite/GeoIP routing rules.
+func ParseContentWithRules(content, groupName string) ([]*model.ProxyNode, []*model.GeoRule, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return nil, fmt.Errorf("empty content")
+		return nil, nil, fmt.Errorf("empty content")
 	}
 
 	// 1. Try base64 decoding
@@ -187,14 +194,15 @@ func ParseContent(content, groupName string) ([]*model.ProxyNode, error) {
 			// Check if base64 decoded content is JSON or YAML or URI lines
 			if strings.HasPrefix(trimmedDecoded, "[") || strings.HasPrefix(trimmedDecoded, "{") {
 				if nodes, jsonErr := parseJSONContent(trimmedDecoded, groupName); jsonErr == nil && len(nodes) > 0 {
-					return nodes, nil
+					rules := ParseJSONRules(trimmedDecoded)
+					return nodes, rules, nil
 				} else if jsonErr != nil && strings.Contains(jsonErr.Error(), "provider rejected") {
-					return nil, jsonErr
+					return nil, nil, jsonErr
 				}
 			}
 			if strings.Contains(trimmedDecoded, "proxies:") {
-				if nodes, yamlErr := parseClashYAML(trimmedDecoded, groupName); yamlErr == nil && len(nodes) > 0 {
-					return nodes, nil
+				if nodes, rules, yamlErr := parseClashYAML(trimmedDecoded, groupName); yamlErr == nil && len(nodes) > 0 {
+					return nodes, rules, nil
 				}
 			}
 			content = trimmedDecoded
@@ -205,18 +213,19 @@ func ParseContent(content, groupName string) ([]*model.ProxyNode, error) {
 	if strings.HasPrefix(content, "[") || strings.HasPrefix(content, "{") {
 		nodes, err := parseJSONContent(content, groupName)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(nodes) > 0 {
-			return nodes, nil
+			rules := ParseJSONRules(content)
+			return nodes, rules, nil
 		}
 	}
 
 	// 3. Check if content is Clash YAML
 	if strings.Contains(content, "proxies:") {
-		nodes, err := parseClashYAML(content, groupName)
+		nodes, rules, err := parseClashYAML(content, groupName)
 		if err == nil && len(nodes) > 0 {
-			return nodes, nil
+			return nodes, rules, nil
 		}
 	}
 
@@ -237,10 +246,10 @@ func ParseContent(content, groupName string) ([]*model.ProxyNode, error) {
 	}
 
 	if len(nodes) == 0 {
-		return nil, fmt.Errorf("no valid proxy nodes found")
+		return nil, nil, fmt.Errorf("no valid proxy nodes found")
 	}
 
-	return nodes, nil
+	return nodes, nil, nil
 }
 
 // parseJSONContent parses Remnawave, Sing-box, or Xray JSON configurations
@@ -563,17 +572,18 @@ func parseOutboundObject(outMap map[string]interface{}, groupName, fallbackName 
 }
 
 // parseClashYAML parses Clash Meta / Mihomo configuration format
-func parseClashYAML(content, groupName string) ([]*model.ProxyNode, error) {
+func parseClashYAML(content, groupName string) ([]*model.ProxyNode, []*model.GeoRule, error) {
 	var cfg struct {
 		Proxies []map[string]interface{} `yaml:"proxies"`
+		Rules   []string                  `yaml:"rules"`
 	}
 
 	if err := yaml.Unmarshal([]byte(content), &cfg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(cfg.Proxies) == 0 {
-		return nil, fmt.Errorf("no proxies found in clash config")
+		return nil, nil, fmt.Errorf("no proxies found in clash config")
 	}
 
 	var nodes []*model.ProxyNode
@@ -673,7 +683,283 @@ func parseClashYAML(content, groupName string) ([]*model.ProxyNode, error) {
 		nodes = append(nodes, node)
 	}
 
-	return nodes, nil
+	rules := parseClashRules(cfg.Rules)
+	return nodes, rules, nil
+}
+
+// parseClashRules extracts GeoSite and GeoIP routing rules from Clash configuration
+func parseClashRules(rules []string) []*model.GeoRule {
+	if len(rules) == 0 {
+		return nil
+	}
+
+	var parsed []*model.GeoRule
+	seen := make(map[string]bool)
+
+	for _, line := range rules {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Split(line, ",")
+		if len(parts) < 3 {
+			continue
+		}
+
+		ruleType := strings.ToUpper(strings.TrimSpace(parts[0]))
+		payload := strings.ToLower(strings.TrimSpace(parts[1]))
+		target := strings.ToLower(strings.TrimSpace(parts[2]))
+
+		var gType model.GeoRuleType
+		switch ruleType {
+		case "GEOSITE":
+			gType = model.GeoTypeSite
+		case "GEOIP":
+			gType = model.GeoTypeIP
+		default:
+			continue
+		}
+
+		if payload == "" || payload == "lan" || payload == "private" {
+			continue
+		}
+
+		action := model.GeoActionProxy
+		if target == "direct" || target == "bypass" {
+			action = model.GeoActionDirect
+		} else if target == "reject" || target == "drop" || target == "block" {
+			action = model.GeoActionBlock
+		}
+
+		key := fmt.Sprintf("%s:%s", gType, payload)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		parsed = append(parsed, &model.GeoRule{
+			Type:   gType,
+			Name:   payload,
+			Action: action,
+		})
+	}
+
+	return parsed
+}
+
+// ParseJSONRules extracts GeoSite, GeoIP, domain, and IP routing rules from Sing-box, Xray, or Remnawave JSON configs
+func ParseJSONRules(content string) []*model.GeoRule {
+	var root interface{}
+	if err := json.Unmarshal([]byte(content), &root); err != nil {
+		return nil
+	}
+
+	var rulesSlice []map[string]interface{}
+
+	if rootMap, ok := root.(map[string]interface{}); ok {
+		// 1. route.rules
+		if route, ok := rootMap["route"].(map[string]interface{}); ok {
+			if rList, ok := route["rules"].([]interface{}); ok {
+				for _, r := range rList {
+					if rm, ok := r.(map[string]interface{}); ok {
+						rulesSlice = append(rulesSlice, rm)
+					}
+				}
+			}
+		}
+		// 2. routing.rules
+		if routing, ok := rootMap["routing"].(map[string]interface{}); ok {
+			if rList, ok := routing["rules"].([]interface{}); ok {
+				for _, r := range rList {
+					if rm, ok := r.(map[string]interface{}); ok {
+						rulesSlice = append(rulesSlice, rm)
+					}
+				}
+			}
+		}
+		// 3. top-level rules
+		if rList, ok := rootMap["rules"].([]interface{}); ok {
+			for _, r := range rList {
+				if rm, ok := r.(map[string]interface{}); ok {
+					rulesSlice = append(rulesSlice, rm)
+				}
+			}
+		}
+	} else if rootArr, ok := root.([]interface{}); ok {
+		// Array of configs (like Remnawave profiles)
+		for _, item := range rootArr {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				if route, ok := itemMap["route"].(map[string]interface{}); ok {
+					if rList, ok := route["rules"].([]interface{}); ok {
+						for _, r := range rList {
+							if rm, ok := r.(map[string]interface{}); ok {
+								rulesSlice = append(rulesSlice, rm)
+							}
+						}
+					}
+				}
+				if routing, ok := itemMap["routing"].(map[string]interface{}); ok {
+					if rList, ok := routing["rules"].([]interface{}); ok {
+						for _, r := range rList {
+							if rm, ok := r.(map[string]interface{}); ok {
+								rulesSlice = append(rulesSlice, rm)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(rulesSlice) == 0 {
+		return nil
+	}
+
+	var parsed []*model.GeoRule
+	seen := make(map[string]bool)
+
+	for _, rm := range rulesSlice {
+		outbound, _ := rm["outbound"].(string)
+		if outbound == "" {
+			outbound, _ = rm["outboundTag"].(string)
+		}
+		if outbound == "" {
+			outbound, _ = rm["action"].(string)
+		}
+		outboundLower := strings.ToLower(strings.TrimSpace(outbound))
+
+		action := model.GeoActionProxy
+		if outboundLower == "direct" || outboundLower == "freedom" || outboundLower == "bypass" {
+			action = model.GeoActionDirect
+		} else if outboundLower == "block" || outboundLower == "blackhole" || outboundLower == "reject" {
+			action = model.GeoActionBlock
+		}
+
+		addRule := func(rType model.GeoRuleType, name string) {
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name == "" {
+				return
+			}
+			key := fmt.Sprintf("%s:%s", rType, name)
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			parsed = append(parsed, &model.GeoRule{
+				Type:   rType,
+				Name:   name,
+				Action: action,
+			})
+		}
+
+		extractSite := func(val string) {
+			val = strings.TrimSpace(val)
+			if val == "" {
+				return
+			}
+			lower := strings.ToLower(val)
+			if strings.HasPrefix(lower, "geosite:") {
+				addRule(model.GeoTypeSite, strings.TrimPrefix(val, val[:8]))
+			} else if strings.HasPrefix(lower, "domain:") {
+				addRule(model.GeoTypeSite, strings.TrimPrefix(val, val[:7]))
+			} else if strings.HasPrefix(lower, "full:") {
+				addRule(model.GeoTypeSite, strings.TrimPrefix(val, val[:5]))
+			} else if strings.HasPrefix(lower, "keyword:") {
+				addRule(model.GeoTypeSite, strings.TrimPrefix(val, val[:8]))
+			} else {
+				addRule(model.GeoTypeSite, val)
+			}
+		}
+
+		extractIP := func(val string) {
+			val = strings.TrimSpace(val)
+			if val == "" {
+				return
+			}
+			lower := strings.ToLower(val)
+			if strings.HasPrefix(lower, "geoip:") {
+				addRule(model.GeoTypeIP, strings.TrimPrefix(val, val[:6]))
+			} else {
+				addRule(model.GeoTypeIP, val)
+			}
+		}
+
+		// 1. Check geosite
+		if gs, ok := rm["geosite"].([]interface{}); ok {
+			for _, v := range gs {
+				if s, ok := v.(string); ok {
+					extractSite(s)
+				}
+			}
+		} else if gs, ok := rm["geosite"].(string); ok {
+			extractSite(gs)
+		}
+
+		// 2. Check domain, domains, domain_suffix, domain_keyword
+		for _, key := range []string{"domain", "domains", "domain_suffix", "domain_keyword"} {
+			if dList, ok := rm[key].([]interface{}); ok {
+				for _, v := range dList {
+					if s, ok := v.(string); ok {
+						extractSite(s)
+					}
+				}
+			} else if dStr, ok := rm[key].(string); ok {
+				extractSite(dStr)
+			}
+		}
+
+		// 3. Check geoip
+		if gi, ok := rm["geoip"].([]interface{}); ok {
+			for _, v := range gi {
+				if s, ok := v.(string); ok {
+					extractIP(s)
+				}
+			}
+		} else if gi, ok := rm["geoip"].(string); ok {
+			extractIP(gi)
+		}
+
+		// 4. Check ip, ips, ip_cidr
+		for _, key := range []string{"ip", "ips", "ip_cidr"} {
+			if ipList, ok := rm[key].([]interface{}); ok {
+				for _, v := range ipList {
+					if s, ok := v.(string); ok {
+						extractIP(s)
+					}
+				}
+			} else if ipStr, ok := rm[key].(string); ok {
+				extractIP(ipStr)
+			}
+		}
+
+		// 5. Check rule_set
+		if rs, ok := rm["rule_set"].([]interface{}); ok {
+			for _, v := range rs {
+				if s, ok := v.(string); ok {
+					sLower := strings.ToLower(s)
+					if strings.HasPrefix(sLower, "geosite-") {
+						addRule(model.GeoTypeSite, strings.TrimPrefix(sLower, "geosite-"))
+					} else if strings.HasPrefix(sLower, "geoip-") {
+						addRule(model.GeoTypeIP, strings.TrimPrefix(sLower, "geoip-"))
+					} else if strings.HasPrefix(sLower, "site-") {
+						addRule(model.GeoTypeSite, strings.TrimPrefix(sLower, "site-"))
+					} else if strings.HasPrefix(sLower, "ip-") {
+						addRule(model.GeoTypeIP, strings.TrimPrefix(sLower, "ip-"))
+					}
+				}
+			}
+		} else if rs, ok := rm["rule_set"].(string); ok {
+			sLower := strings.ToLower(rs)
+			if strings.HasPrefix(sLower, "geosite-") {
+				addRule(model.GeoTypeSite, strings.TrimPrefix(sLower, "geosite-"))
+			} else if strings.HasPrefix(sLower, "geoip-") {
+				addRule(model.GeoTypeIP, strings.TrimPrefix(sLower, "geoip-"))
+			}
+		}
+	}
+
+	return parsed
 }
 
 func tryBase64Decode(s string) (string, error) {

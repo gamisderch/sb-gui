@@ -2,6 +2,7 @@ package geo
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -301,6 +302,48 @@ func (m *Manager) GetGeoIPCodes(singboxBin string) ([]string, error) {
 	return list, nil
 }
 
+// IsGeoSiteCategory returns whether a given tag exists in geosite.db
+func (m *Manager) IsGeoSiteCategory(singboxBin, name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	m.mu.RLock()
+	if len(m.cachedSites) > 0 {
+		ok := m.cachedSiteMap[lower]
+		m.mu.RUnlock()
+		return ok
+	}
+	m.mu.RUnlock()
+
+	sites, err := m.GetGeoSiteCategories(singboxBin)
+	if err != nil || len(sites) == 0 {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cachedSiteMap[lower]
+}
+
+// IsGeoIPCode returns whether a given code is a country code in geoip.db
+func (m *Manager) IsGeoIPCode(singboxBin, code string) bool {
+	lower := strings.ToLower(strings.TrimSpace(code))
+	m.mu.RLock()
+	if len(m.cachedIPs) > 0 {
+		ok := m.cachedIPMap[lower]
+		m.mu.RUnlock()
+		return ok
+	}
+	m.mu.RUnlock()
+
+	ips, err := m.GetGeoIPCodes(singboxBin)
+	if err == nil && len(ips) > 0 {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return m.cachedIPMap[lower]
+	}
+
+	// Fallback check: 2-letter ASCII country code
+	return len(lower) == 2 && lower[0] >= 'a' && lower[0] <= 'z' && lower[1] >= 'a' && lower[1] <= 'z'
+}
+
 // CompileRuleSet exports and compiles a rule-set from geo databases into binary (.srs)
 func (m *Manager) CompileRuleSet(singboxBin string, rule *model.GeoRule) (srsPath string, isBinary bool, err error) {
 	rulesDir := m.GetRulesDir()
@@ -308,76 +351,220 @@ func (m *Manager) CompileRuleSet(singboxBin string, rule *model.GeoRule) (srsPat
 
 	nameSanitized := strings.ReplaceAll(rule.Name, "@", "_")
 	nameSanitized = strings.ReplaceAll(nameSanitized, "!", "not_")
+	nameSanitized = strings.ReplaceAll(nameSanitized, "/", "_")
+	nameSanitized = strings.ReplaceAll(nameSanitized, ":", "_")
 
 	prefix := string(rule.Type)
 	binSRS := filepath.Join(rulesDir, fmt.Sprintf("%s-%s.srs", prefix, nameSanitized))
 	srcJSON := filepath.Join(rulesDir, fmt.Sprintf("%s-%s.json", prefix, nameSanitized))
 
-	var dbPath string
+	isDB := false
 	if rule.Type == model.GeoTypeSite {
-		dbPath = m.GetGeoSitePath()
+		isDB = m.IsGeoSiteCategory(singboxBin, rule.Name)
 	} else {
-		dbPath = m.GetGeoIPPath()
+		isDB = m.IsGeoIPCode(singboxBin, rule.Name)
 	}
 
-	dbInfo, dbErr := os.Stat(dbPath)
+	if isDB {
+		var dbPath string
+		if rule.Type == model.GeoTypeSite {
+			dbPath = m.GetGeoSitePath()
+		} else {
+			dbPath = m.GetGeoIPPath()
+		}
 
-	// If binary SRS exists and is newer than database, reuse it
-	if srsInfo, err := os.Stat(binSRS); err == nil && dbErr == nil {
-		if srsInfo.ModTime().After(dbInfo.ModTime()) {
-			return binSRS, true, nil
+		dbInfo, dbErr := os.Stat(dbPath)
+
+		// If binary SRS exists and is newer than database, reuse it
+		if srsInfo, err := os.Stat(binSRS); err == nil && dbErr == nil {
+			if srsInfo.ModTime().After(dbInfo.ModTime()) {
+				return binSRS, true, nil
+			}
+		}
+
+		if dbErr == nil {
+			var exportCmd *exec.Cmd
+			if rule.Type == model.GeoTypeSite {
+				exportCmd = exec.Command(singboxBin, "geosite", "export", rule.Name, "-f", dbPath, "-o", srcJSON)
+			} else {
+				exportCmd = exec.Command(singboxBin, "geoip", "export", rule.Name, "-f", dbPath, "-o", srcJSON)
+			}
+
+			if out, err := exportCmd.CombinedOutput(); err == nil {
+				compileCmd := exec.Command(singboxBin, "rule-set", "compile", srcJSON, "-o", binSRS)
+				if err := compileCmd.Run(); err == nil {
+					_ = os.Remove(srcJSON)
+					return binSRS, true, nil
+				}
+				_ = out
+				return srcJSON, false, nil
+			}
 		}
 	}
 
-	if dbErr != nil {
-		return "", false, fmt.Errorf("database %s not found (run sync first): %w", dbPath, dbErr)
-	}
-
-	// 1. Export from database
-	var exportCmd *exec.Cmd
+	// Custom domain or IP CIDR rule fallback
+	ruleItem := make(map[string]interface{})
 	if rule.Type == model.GeoTypeSite {
-		exportCmd = exec.Command(singboxBin, "geosite", "export", rule.Name, "-f", dbPath, "-o", srcJSON)
+		name := rule.Name
+		if strings.Contains(name, ".") {
+			ruleItem["domain_suffix"] = []string{name}
+		} else {
+			ruleItem["domain_suffix"] = []string{name}
+			ruleItem["domain_keyword"] = []string{name}
+		}
 	} else {
-		exportCmd = exec.Command(singboxBin, "geoip", "export", rule.Name, "-f", dbPath, "-o", srcJSON)
+		ruleItem["ip_cidr"] = []string{rule.Name}
 	}
 
-	if out, err := exportCmd.CombinedOutput(); err != nil {
-		return "", false, fmt.Errorf("failed to export %s %s: %s (%w)", rule.Type, rule.Name, strings.TrimSpace(string(out)), err)
+	content := map[string]interface{}{
+		"version": 2,
+		"rules": []map[string]interface{}{
+			ruleItem,
+		},
 	}
-
-	// 2. Compile to binary .srs
+	data, _ := json.MarshalIndent(content, "", "  ")
+	_ = os.WriteFile(srcJSON, data, 0644)
 	compileCmd := exec.Command(singboxBin, "rule-set", "compile", srcJSON, "-o", binSRS)
-	if out, err := compileCmd.CombinedOutput(); err != nil {
-		// If compile command failed, we can still fall back to source JSON!
-		_ = out
-		return srcJSON, false, nil
+	if err := compileCmd.Run(); err == nil {
+		_ = os.Remove(srcJSON)
+		return binSRS, true, nil
+	}
+	return srcJSON, false, nil
+}
+
+func (m *Manager) compileCustomBatchRuleSet(singboxBin string, action model.GeoRuleAction, domains []string, ips []string) (string, bool, error) {
+	rulesDir := m.GetRulesDir()
+	_ = os.MkdirAll(rulesDir, 0755)
+
+	binSRS := filepath.Join(rulesDir, fmt.Sprintf("custom-%s.srs", action))
+	srcJSON := filepath.Join(rulesDir, fmt.Sprintf("custom-%s.json", action))
+
+	ruleItem := make(map[string]interface{})
+
+	var domainSuffixes []string
+	var domainKeywords []string
+
+	for _, d := range domains {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		if strings.Contains(d, ".") {
+			domainSuffixes = append(domainSuffixes, d)
+		} else {
+			domainSuffixes = append(domainSuffixes, d)
+			domainKeywords = append(domainKeywords, d)
+		}
 	}
 
-	// Remove intermediary JSON to save disk space
-	_ = os.Remove(srcJSON)
-	return binSRS, true, nil
+	if len(domainSuffixes) > 0 {
+		ruleItem["domain_suffix"] = domainSuffixes
+	}
+	if len(domainKeywords) > 0 {
+		ruleItem["domain_keyword"] = domainKeywords
+	}
+
+	var ipCidrs []string
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			ipCidrs = append(ipCidrs, ip)
+		}
+	}
+	if len(ipCidrs) > 0 {
+		ruleItem["ip_cidr"] = ipCidrs
+	}
+
+	content := map[string]interface{}{
+		"version": 2,
+		"rules": []map[string]interface{}{
+			ruleItem,
+		},
+	}
+
+	data, err := json.MarshalIndent(content, "", "  ")
+	if err != nil {
+		return "", false, err
+	}
+
+	if err := os.WriteFile(srcJSON, data, 0644); err != nil {
+		return "", false, err
+	}
+
+	compileCmd := exec.Command(singboxBin, "rule-set", "compile", srcJSON, "-o", binSRS)
+	if err := compileCmd.Run(); err == nil {
+		_ = os.Remove(srcJSON)
+		return binSRS, true, nil
+	}
+
+	return srcJSON, false, nil
 }
 
 // EnsureRuleSets compiles all active geo rules and returns metadata for sing-box configuration
 func (m *Manager) EnsureRuleSets(singboxBin string, rules []*model.GeoRule) ([]RuleSetMeta, error) {
 	var metas []RuleSetMeta
+
+	customDomains := make(map[model.GeoRuleAction][]string)
+	customIPs := make(map[model.GeoRuleAction][]string)
+
 	for _, r := range rules {
 		if r == nil || strings.TrimSpace(r.Name) == "" {
 			continue
 		}
-		path, isBin, err := m.CompileRuleSet(singboxBin, r)
-		if err != nil {
-			// Non-fatal: log and skip rule that cannot be compiled
+		name := strings.TrimSpace(r.Name)
+
+		if r.Type == model.GeoTypeSite {
+			if m.IsGeoSiteCategory(singboxBin, name) {
+				path, isBin, err := m.CompileRuleSet(singboxBin, r)
+				if err == nil {
+					tag := fmt.Sprintf("%s-%s", r.Type, strings.ReplaceAll(name, "@", "_"))
+					metas = append(metas, RuleSetMeta{
+						Tag:      tag,
+						Path:     path,
+						IsBinary: isBin,
+						Action:   r.Action,
+					})
+				}
+			} else {
+				customDomains[r.Action] = append(customDomains[r.Action], name)
+			}
+		} else if r.Type == model.GeoTypeIP {
+			if m.IsGeoIPCode(singboxBin, name) {
+				path, isBin, err := m.CompileRuleSet(singboxBin, r)
+				if err == nil {
+					tag := fmt.Sprintf("%s-%s", r.Type, strings.ReplaceAll(name, "@", "_"))
+					metas = append(metas, RuleSetMeta{
+						Tag:      tag,
+						Path:     path,
+						IsBinary: isBin,
+						Action:   r.Action,
+					})
+				}
+			} else {
+				customIPs[r.Action] = append(customIPs[r.Action], name)
+			}
+		}
+	}
+
+	// Compile custom rule-sets batched by action
+	for _, action := range []model.GeoRuleAction{model.GeoActionBlock, model.GeoActionDirect, model.GeoActionProxy} {
+		domains := customDomains[action]
+		ips := customIPs[action]
+		if len(domains) == 0 && len(ips) == 0 {
 			continue
 		}
-		tag := fmt.Sprintf("%s-%s", r.Type, strings.ReplaceAll(r.Name, "@", "_"))
-		metas = append(metas, RuleSetMeta{
-			Tag:      tag,
-			Path:     path,
-			IsBinary: isBin,
-			Action:   r.Action,
-		})
+
+		path, isBin, err := m.compileCustomBatchRuleSet(singboxBin, action, domains, ips)
+		if err == nil {
+			metas = append(metas, RuleSetMeta{
+				Tag:      fmt.Sprintf("custom-%s", action),
+				Path:     path,
+				IsBinary: isBin,
+				Action:   action,
+			})
+		}
 	}
+
 	return metas, nil
 }
 

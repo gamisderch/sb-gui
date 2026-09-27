@@ -26,17 +26,22 @@ func (m *Model) RenderGeoView() string {
 	titleStyle := lipgloss.NewStyle().Foreground(ColorPrimary).Background(ColorBg).Bold(true)
 
 	// Top border
-	headerLabel := " GeoSite & GeoIP Routing Rules & Database Sync "
-	if m.geoInActionView {
+	headerLabel := " GeoSite & GeoIP Routing Profiles "
+	if m.geoModeAdd {
+		action := m.getCurrentGeoAction()
+		headerLabel = fmt.Sprintf(" [%s] > Add Rules to %s ", m.getActiveProfileName(), strings.ToUpper(string(action)))
+	} else if m.geoInActionView {
 		action := m.getCurrentGeoAction()
 		switch action {
 		case model.GeoActionDirect:
-			headerLabel = " Routing Rules: DIRECT (Bypass VPN) "
+			headerLabel = fmt.Sprintf(" [%s] > DIRECT (Bypass VPN) ", m.getActiveProfileName())
 		case model.GeoActionProxy:
-			headerLabel = " Routing Rules: PROXY (Route via VPN) "
+			headerLabel = fmt.Sprintf(" [%s] > PROXY (Route via VPN) ", m.getActiveProfileName())
 		case model.GeoActionBlock:
-			headerLabel = " Routing Rules: BLOCK (Drop Traffic) "
+			headerLabel = fmt.Sprintf(" [%s] > BLOCK (Drop Traffic) ", m.getActiveProfileName())
 		}
+	} else if m.geoInProfileView {
+		headerLabel = fmt.Sprintf(" Routing Rules: [%s] ", m.getActiveProfileName())
 	}
 	labelW := lipgloss.Width(headerLabel)
 	fillerW := width - 2 - labelW - 1
@@ -75,13 +80,15 @@ func (m *Model) RenderGeoView() string {
 	innerLines = append(innerLines, padLine(borderStyle.Render("  "+strings.Repeat("─", innerWidth-4)), innerWidth))
 	innerLines = append(innerLines, emptyBlackLine(innerWidth))
 
-	// 2. Body: Either Add-Rule Modal/Picker OR Action View (2 tabs) OR Action Menu (Direct/Proxy/Block)
+	// 2. Body: Add-Rule Modal/Picker (L3) OR Action View 2 tabs (L2) OR Action Menu (L1) OR Profile Menu (L0)
 	if m.geoModeAdd {
 		innerLines = append(innerLines, m.renderGeoAddPicker(innerWidth, height-8)...)
 	} else if m.geoInActionView {
 		innerLines = append(innerLines, m.renderGeoActionView(innerWidth, height-8)...)
-	} else {
+	} else if m.geoInProfileView {
 		innerLines = append(innerLines, m.renderGeoActionMenu(innerWidth, height-8)...)
+	} else {
+		innerLines = append(innerLines, m.renderGeoProfileMenu(innerWidth, height-8)...)
 	}
 
 	// Pad or truncate
@@ -102,12 +109,121 @@ func (m *Model) RenderGeoView() string {
 	return strings.Join(allLines, "\n")
 }
 
+// renderGeoProfileMenu renders Level 0: list of routing profiles (Global + Subscriptions)
+func (m *Model) renderGeoProfileMenu(innerWidth, maxRows int) []string {
+	var lines []string
+
+	hdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render(
+		"  Routing Profiles (Select Global or a Subscription to configure its GeoSite/GeoIP rules):",
+	)
+	lines = append(lines, padLine(hdr, innerWidth), emptyBlackLine(innerWidth))
+
+	totalProfiles := len(m.state.Subscriptions) + 1
+	if m.geoProfileIdx >= totalProfiles {
+		m.geoProfileIdx = totalProfiles - 1
+	}
+	if m.geoProfileIdx < 0 {
+		m.geoProfileIdx = 0
+	}
+
+	// [0] Global / Default Rules entry
+	gSite, gIP := 0, 0
+	for _, r := range m.state.GeoRules {
+		if r.Type == model.GeoTypeSite {
+			gSite++
+		} else {
+			gIP++
+		}
+	}
+	globalCountBadge := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
+		fmt.Sprintf("(%d GeoSite, %d GeoIP)", gSite, gIP),
+	)
+	globalTag := StyleSuccess.Render("[Global Default]")
+
+	globalTitle := fmt.Sprintf("  [0] %s  %-26s  %s", globalTag, "Global / Default Rules", globalCountBadge)
+	if m.geoProfileIdx == 0 {
+		globalTitle = fmt.Sprintf("  ▶ [0] %s  %-26s  %s", globalTag, "Global / Default Rules", globalCountBadge)
+		lines = append(lines, padLine(StyleSelectedRow.Render(globalTitle), innerWidth))
+	} else {
+		lines = append(lines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(globalTitle), innerWidth))
+	}
+	globalDesc := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
+		"        Routing rules applied by default to all connections and subscriptions without custom rules.",
+	)
+	lines = append(lines, padLine(globalDesc, innerWidth), emptyBlackLine(innerWidth))
+
+	// Section 2: Subscriptions
+	secDivider := padLine(lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("  ── Subscriptions Profiles ──────────────────────────────────────────────────"), innerWidth)
+	lines = append(lines, secDivider, emptyBlackLine(innerWidth))
+
+	if len(m.state.Subscriptions) == 0 {
+		noSub := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
+			"    No subscriptions added yet. (Press [a] in Main view to add subscriptions)",
+		)
+		lines = append(lines, padLine(noSub, innerWidth), emptyBlackLine(innerWidth))
+	} else {
+		for i, sub := range m.state.Subscriptions {
+			profIdx := i + 1
+			ruleCount := len(sub.GeoRules)
+
+			var countBadge string
+			if ruleCount == 0 {
+				countBadge = lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("(empty / inherits Global)")
+			} else {
+				dCnt, pCnt, bCnt := 0, 0, 0
+				for _, r := range sub.GeoRules {
+					switch r.Action {
+					case model.GeoActionDirect:
+						dCnt++
+					case model.GeoActionProxy:
+						pCnt++
+					case model.GeoActionBlock:
+						bCnt++
+					}
+				}
+				countBadge = lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Bold(true).Render(
+					fmt.Sprintf("(%d rules: %d DIRECT, %d PROXY, %d BLOCK)", ruleCount, dCnt, pCnt, bCnt),
+				)
+			}
+
+			subTag := lipgloss.NewStyle().Foreground(ColorSecondary).Background(ColorBg).Bold(true).Render("[Subscription]")
+			subTitle := fmt.Sprintf("  [%d] %s  %-26s  %s", profIdx, subTag, sub.Name, countBadge)
+			if profIdx == m.geoProfileIdx {
+				subTitle = fmt.Sprintf("  ▶ [%d] %s  %-26s  %s", profIdx, subTag, sub.Name, countBadge)
+				lines = append(lines, padLine(StyleSelectedRow.Render(subTitle), innerWidth))
+			} else {
+				lines = append(lines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(subTitle), innerWidth))
+			}
+
+			nodeInfo := fmt.Sprintf("%d servers", len(sub.Nodes))
+			if sub.URL != "" {
+				nodeInfo += " │ " + sub.URL
+			}
+			if len(nodeInfo) > innerWidth-12 {
+				nodeInfo = nodeInfo[:innerWidth-15] + "..."
+			}
+			subDesc := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
+				fmt.Sprintf("        %s", nodeInfo),
+			)
+			lines = append(lines, padLine(subDesc, innerWidth), emptyBlackLine(innerWidth))
+		}
+	}
+
+	lines = append(lines, padLine(lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("  "+strings.Repeat("─", innerWidth-4)), innerWidth))
+	hintBar := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
+		"  [↑/↓] Select   [Enter / 0..9] Rules   [J/K] Move   [d/Del] Delete/Clear   [u] Sync DBs   [q/Esc] Back",
+	)
+	lines = append(lines, padLine(hintBar, innerWidth))
+
+	return lines
+}
+
 // renderGeoActionMenu renders Level 1: menu with Direct, Proxy, Block options
 func (m *Model) renderGeoActionMenu(innerWidth, maxRows int) []string {
 	var lines []string
 
 	hdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render(
-		"  Routing Rule Groups (Select a group to configure GeoSite and GeoIP tabs):",
+		fmt.Sprintf("  Profile: [%s]  (Select a group to configure GeoSite and GeoIP tabs):", m.getActiveProfileName()),
 	)
 	lines = append(lines, padLine(hdr, innerWidth), emptyBlackLine(innerWidth))
 
@@ -169,7 +285,7 @@ func (m *Model) renderGeoActionMenu(innerWidth, maxRows int) []string {
 
 	lines = append(lines, padLine(lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("  "+strings.Repeat("─", innerWidth-4)), innerWidth))
 	hintBar := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
-		"  [↑/↓] Select Group   [Enter / 1..3] Open Tabs   [u] Sync DBs   [q/Esc] Back to Settings",
+		"  [↑/↓] Select Group   [Enter / 1..3] Open Tabs   [u] Sync DBs   [q/Esc] Back to Profiles",
 	)
 	lines = append(lines, padLine(hintBar, innerWidth))
 
@@ -196,7 +312,7 @@ func (m *Model) renderGeoActionView(innerWidth, maxRows int) []string {
 
 	// Top action indicator
 	titleLine := lipgloss.NewStyle().Bold(true).Foreground(ColorWhite).Background(ColorBg).Render(
-		fmt.Sprintf("  Group: %s %s", actionBadge, actionTitle),
+		fmt.Sprintf("  Profile: %s   │   Group: %s %s", StylePrimary.Render(m.getActiveProfileName()), actionBadge, actionTitle),
 	)
 	lines = append(lines, padLine(titleLine, innerWidth))
 
@@ -241,19 +357,39 @@ func (m *Model) renderGeoActionView(innerWidth, maxRows int) []string {
 		)
 		lines = append(lines, padLine(noRules1, innerWidth), padLine(noRules2, innerWidth))
 	} else {
-		if m.geoRuleCursor >= len(rules) {
-			m.geoRuleCursor = len(rules) - 1
+		total := len(rules)
+		visRows := maxRows - 8
+		if visRows < 5 {
+			visRows = 5
+		}
+
+		if m.geoRuleCursor >= total {
+			m.geoRuleCursor = total - 1
 		}
 		if m.geoRuleCursor < 0 {
 			m.geoRuleCursor = 0
 		}
 
-		for i, r := range rules {
+		// Adjust scroll offset
+		if m.geoRuleCursor < m.geoRuleScroll {
+			m.geoRuleScroll = m.geoRuleCursor
+		}
+		if m.geoRuleCursor >= m.geoRuleScroll+visRows {
+			m.geoRuleScroll = m.geoRuleCursor - visRows + 1
+		}
+
+		end := m.geoRuleScroll + visRows
+		if end > total {
+			end = total
+		}
+
+		for i := m.geoRuleScroll; i < end; i++ {
+			r := rules[i]
 			tBadge := lipgloss.NewStyle().Foreground(ColorSecondary).Background(ColorBg).Bold(true).Render("[GeoSite]")
 			if r.Type == model.GeoTypeIP {
 				tBadge = lipgloss.NewStyle().Foreground(ColorWarning).Background(ColorBg).Bold(true).Render("[ GeoIP ]")
 			}
-			numStr := fmt.Sprintf("%2d.", i+1)
+			numStr := fmt.Sprintf("%3d.", i+1)
 			nameStr := r.Name
 			if len(nameStr) > 34 {
 				nameStr = nameStr[:31] + "..."
@@ -266,11 +402,18 @@ func (m *Model) renderGeoActionView(innerWidth, maxRows int) []string {
 				lines = append(lines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(rowText), innerWidth))
 			}
 		}
+
+		if total > visRows {
+			scrollInfo := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
+				fmt.Sprintf("    Showing %d..%d of %d rules  (Press PgUp/PgDn to scroll)", m.geoRuleScroll+1, end, total),
+			)
+			lines = append(lines, padLine(scrollInfo, innerWidth))
+		}
 	}
 
 	lines = append(lines, emptyBlackLine(innerWidth))
 	hintBar := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
-		"  [a] Add Rule   [Tab] Switch Tab   [Space] Move Action   [d/Del] Delete   [q/Esc] Back to Menu",
+		"  [a] Add Rule   [Tab] Switch Tab   [Space] Move Action   [Del / d] Delete   [q/Esc] Back to Menu",
 	)
 	lines = append(lines, padLine(hintBar, innerWidth))
 
@@ -291,7 +434,7 @@ func (m *Model) renderGeoAddPicker(innerWidth, maxRows int) []string {
 	}
 
 	boxTitle := lipgloss.NewStyle().Bold(true).Foreground(ColorPrimary).Background(ColorBg).Render(
-		fmt.Sprintf("  ── Add Rules to %s (Search Database) ──", currBadge),
+		fmt.Sprintf("  ── Add Rules to [%s] > %s (Search Database) ──", m.getActiveProfileName(), currBadge),
 	)
 	lines = append(lines, padLine(boxTitle, innerWidth))
 
@@ -386,7 +529,7 @@ func (m *Model) renderGeoAddPicker(innerWidth, maxRows int) []string {
 			}
 
 			var existingRule *model.GeoRule
-			for _, r := range m.state.GeoRules {
+			for _, r := range m.getActiveProfileRules() {
 				if r.Type == ruleType && strings.EqualFold(r.Name, item) {
 					existingRule = r
 					break
@@ -449,8 +592,35 @@ func (m *Model) getPickerItems() []string {
 	return filtered
 }
 
+// getActiveProfileRules returns the slice of GeoRules for the currently selected profile
+func (m *Model) getActiveProfileRules() []*model.GeoRule {
+	if m.geoProfileIdx <= 0 || m.geoProfileIdx > len(m.state.Subscriptions) {
+		return m.state.GeoRules
+	}
+	sub := m.state.Subscriptions[m.geoProfileIdx-1]
+	return sub.GeoRules
+}
+
+// setActiveProfileRules sets the slice of GeoRules for the currently selected profile
+func (m *Model) setActiveProfileRules(rules []*model.GeoRule) {
+	if m.geoProfileIdx <= 0 || m.geoProfileIdx > len(m.state.Subscriptions) {
+		m.state.GeoRules = rules
+	} else {
+		sub := m.state.Subscriptions[m.geoProfileIdx-1]
+		sub.GeoRules = rules
+	}
+}
+
+// getActiveProfileName returns the display name for the currently selected profile
+func (m *Model) getActiveProfileName() string {
+	if m.geoProfileIdx <= 0 || m.geoProfileIdx > len(m.state.Subscriptions) {
+		return "Global / Default"
+	}
+	return m.state.Subscriptions[m.geoProfileIdx-1].Name
+}
+
 func (m *Model) getGeoActionCount(action model.GeoRuleAction) (siteCount, ipCount int) {
-	for _, r := range m.state.GeoRules {
+	for _, r := range m.getActiveProfileRules() {
 		if r.Action == action {
 			if r.Type == model.GeoTypeSite {
 				siteCount++
@@ -464,7 +634,7 @@ func (m *Model) getGeoActionCount(action model.GeoRuleAction) (siteCount, ipCoun
 
 func (m *Model) getFilteredGeoRules(action model.GeoRuleAction, rType model.GeoRuleType) []*model.GeoRule {
 	var list []*model.GeoRule
-	for _, r := range m.state.GeoRules {
+	for _, r := range m.getActiveProfileRules() {
 		if r.Action == action && r.Type == rType {
 			list = append(list, r)
 		}
@@ -486,9 +656,11 @@ func (m *Model) getCurrentGeoAction() model.GeoRuleAction {
 }
 
 func (m *Model) removeGeoRule(target *model.GeoRule) {
-	for i, r := range m.state.GeoRules {
+	rules := m.getActiveProfileRules()
+	for i, r := range rules {
 		if r == target || (r.Type == target.Type && strings.EqualFold(r.Name, target.Name) && r.Action == target.Action) {
-			m.state.GeoRules = append(m.state.GeoRules[:i], m.state.GeoRules[i+1:]...)
+			rules = append(rules[:i], rules[i+1:]...)
+			m.setActiveProfileRules(rules)
 			break
 		}
 	}

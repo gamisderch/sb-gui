@@ -20,16 +20,16 @@ import (
 
 // Engine manages the proxy and TUN cores (Xray + Sing-box)
 type Engine struct {
-	mu          sync.Mutex
-	cmdXray     *exec.Cmd
-	cmdSingBox  *exec.Cmd
-	xrayBin     string
-	singboxBin  string
-	xrayCfgPath string
-	sbCfgPath   string
-	xrayLogPath string
-	sbLogPath   string
-	xrayPidPath string
+	mu              sync.Mutex
+	cmdXray         *exec.Cmd
+	cmdSingBox      *exec.Cmd
+	xrayBin         string
+	singboxBin      string
+	xrayCfgPath     string
+	sbCfgPath       string
+	xrayLogPath     string
+	sbLogPath       string
+	xrayPidPath     string
 	sbPidPath       string
 	connectedAtPath string
 	isRunning       bool
@@ -38,6 +38,10 @@ type Engine struct {
 	bypassList      []string
 	geoRules        []*model.GeoRule
 	geoMgr          *geo.Manager
+	ipType          model.IPTypePreference
+	fragConfig      model.FragmentationConfig
+	muxConfig       model.MuxConfig
+	advConfig       model.AdvancedTunnelConfig
 }
 
 func resolveBinary(name string) string {
@@ -98,6 +102,10 @@ func NewEngine() *Engine {
 		connectedAtPath: filepath.Join(tmpDir, "connected_at"),
 		isRunning:       false,
 		geoMgr:          geo.NewManager(),
+		ipType:          model.IPTypePreferIPv4,
+		fragConfig:      model.DefaultFragmentationConfig(),
+		muxConfig:       model.DefaultMuxConfig(),
+		advConfig:       model.DefaultAdvancedTunnelConfig(),
 	}
 }
 
@@ -276,6 +284,72 @@ func (e *Engine) UpdateGeoRules(geoRules []*model.GeoRule) error {
 	return nil
 }
 
+// SetTunnelOptions sets tunnel options prior to starting
+func (e *Engine) SetTunnelOptions(ipType model.IPTypePreference, frag model.FragmentationConfig, mux model.MuxConfig, adv model.AdvancedTunnelConfig) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ipType != "" {
+		e.ipType = ipType
+	}
+	e.fragConfig = frag
+	e.muxConfig = mux
+	e.advConfig = adv
+}
+
+// UpdateTunnelConfig updates fragmentation, mux, IP type, and advanced settings on the fly
+func (e *Engine) UpdateTunnelConfig(ipType model.IPTypePreference, frag model.FragmentationConfig, mux model.MuxConfig, adv model.AdvancedTunnelConfig) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if ipType != "" {
+		e.ipType = ipType
+	}
+	e.fragConfig = frag
+	e.muxConfig = mux
+	e.advConfig = adv
+
+	if !e.isRunning || e.activeNode == nil {
+		return nil
+	}
+
+	LogInfo("Updating tunnel configuration on the fly...")
+	// Gracefully reload cores
+	e.stopSingBoxLocked()
+	if e.cmdXray != nil && e.cmdXray.Process != nil {
+		proc := e.cmdXray.Process
+		_ = proc.Signal(syscall.SIGTERM)
+		for i := 0; i < 15; i++ {
+			time.Sleep(50 * time.Millisecond)
+			if err := proc.Signal(syscall.Signal(0)); err != nil {
+				break
+			}
+		}
+		if err := proc.Signal(syscall.Signal(0)); err == nil {
+			_ = proc.Kill()
+		}
+		e.cmdXray = nil
+	}
+	killExistingCores()
+	waitForTunReleased(1 * time.Second)
+
+	if err := e.startXray(e.activeNode); err != nil {
+		return fmt.Errorf("failed to restart proxy core with new config: %w", err)
+	}
+
+	if err := e.startSingboxTUN(e.activeNode, e.bypassList, e.geoRules); err != nil {
+		if strings.Contains(err.Error(), "device or resource busy") {
+			killExistingCores()
+			waitForTunReleased(1 * time.Second)
+			err = e.startSingboxTUN(e.activeNode, e.bypassList, e.geoRules)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to restart sing-box with new config: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // Stop cleanly terminates all running cores
 func (e *Engine) Stop() error {
 	e.mu.Lock()
@@ -433,7 +507,76 @@ func (e *Engine) startSingboxTUN(node *model.ProxyNode, bypassList []string, geo
 	return nil
 }
 
+func mapIPTypeToXrayStrategy(ipType model.IPTypePreference) string {
+	switch ipType {
+	case model.IPTypeIPv4Only:
+		return "UseIPv4"
+	case model.IPTypeIPv6Only:
+		return "UseIPv6"
+	case model.IPTypePreferIPv6:
+		return "UseIPv6v4"
+	default:
+		return "UseIPv4v6"
+	}
+}
+
 func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
+	var fragOutbound map[string]interface{}
+	if e.fragConfig.Enabled {
+		packets := e.fragConfig.Packets
+		if packets == "" {
+			packets = "tlshello"
+		}
+		length := e.fragConfig.Length
+		if length == "" {
+			length = "100-200"
+		}
+		interval := e.fragConfig.Interval
+		if interval == "" {
+			interval = "10-20"
+		}
+		fragOutbound = map[string]interface{}{
+			"tag":      "fragment",
+			"protocol": "freedom",
+			"settings": map[string]interface{}{
+				"domainStrategy": mapIPTypeToXrayStrategy(e.ipType),
+				"fragment": map[string]interface{}{
+					"packets":  packets,
+					"length":   length,
+					"interval": interval,
+				},
+			},
+			"streamSettings": map[string]interface{}{
+				"sockopt": map[string]interface{}{
+					"mark":       255,
+					"tcpNoDelay": true,
+				},
+			},
+		}
+	}
+
+	var muxBlock map[string]interface{}
+	if e.muxConfig.Enabled {
+		conc := e.muxConfig.Concurrency
+		if conc <= 0 {
+			conc = 8
+		}
+		xudp := e.muxConfig.XUDPConcurrency
+		if xudp <= 0 {
+			xudp = 16
+		}
+		udp443 := e.muxConfig.XUDPProxyUDP443
+		if udp443 == "" {
+			udp443 = "reject"
+		}
+		muxBlock = map[string]interface{}{
+			"enabled":         true,
+			"concurrency":     conc,
+			"xudpConcurrency": xudp,
+			"xudpProxyUDP443": udp443,
+		}
+	}
+
 	// If node contains a full pre-configured raw JSON profile (e.g. from Remnawave, V2Ray or custom JSON)
 	if rawJSON, ok := node.Details["raw_json"]; ok && strings.TrimSpace(rawJSON) != "" {
 		var cfg map[string]interface{}
@@ -447,6 +590,12 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 						if strings.ToLower(proto) == "socks" {
 							inMap["port"] = 2080
 							inMap["listen"] = "127.0.0.1"
+							if e.advConfig.EnableSniffing {
+								inMap["sniffing"] = map[string]interface{}{
+									"enabled":      true,
+									"destOverride": []string{"http", "tls", "quic"},
+								}
+							}
 							hasSocks2080 = true
 							break
 						}
@@ -454,18 +603,23 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 				}
 			}
 			if !hasSocks2080 {
-				newInbounds := []map[string]interface{}{
-					{
-						"tag":      "socks-in",
-						"port":     2080,
-						"listen":   "127.0.0.1",
-						"protocol": "socks",
-						"settings": map[string]interface{}{
-							"udp":  true,
-							"auth": "noauth",
-						},
+				socksIn := map[string]interface{}{
+					"tag":      "socks-in",
+					"port":     2080,
+					"listen":   "127.0.0.1",
+					"protocol": "socks",
+					"settings": map[string]interface{}{
+						"udp":  true,
+						"auth": "noauth",
 					},
 				}
+				if e.advConfig.EnableSniffing {
+					socksIn["sniffing"] = map[string]interface{}{
+						"enabled":      true,
+						"destOverride": []string{"http", "tls", "quic"},
+					}
+				}
+				newInbounds := []map[string]interface{}{socksIn}
 				if inbounds, ok := cfg["inbounds"].([]interface{}); ok {
 					for _, in := range inbounds {
 						if inMap, ok := in.(map[string]interface{}); ok {
@@ -476,23 +630,36 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 				cfg["inbounds"] = newInbounds
 			}
 
-			// 2. Ensure all proxy outbounds have sockopt mark 255 to bypass routing loops
+			// 2. Ensure all proxy outbounds have sockopt mark 255, and inject fragmentation & mux
 			if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
 				for _, out := range outbounds {
 					if outMap, ok := out.(map[string]interface{}); ok {
 						proto, _ := outMap["protocol"].(string)
 						proto = strings.ToLower(proto)
-						if proto != "freedom" && proto != "blackhole" && proto != "direct" && proto != "block" {
+						if proto != "freedom" && proto != "blackhole" && proto != "direct" && proto != "block" && proto != "fragment" {
 							streamSettings, _ := outMap["streamSettings"].(map[string]interface{})
 							if streamSettings == nil {
 								streamSettings = make(map[string]interface{})
 							}
-							streamSettings["sockopt"] = map[string]interface{}{
-								"mark": 255,
+							sockopt, _ := streamSettings["sockopt"].(map[string]interface{})
+							if sockopt == nil {
+								sockopt = make(map[string]interface{})
 							}
+							sockopt["mark"] = 255
+							if fragOutbound != nil {
+								sockopt["dialerProxy"] = "fragment"
+							}
+							streamSettings["sockopt"] = sockopt
 							outMap["streamSettings"] = streamSettings
+
+							if muxBlock != nil {
+								outMap["mux"] = muxBlock
+							}
 						}
 					}
+				}
+				if fragOutbound != nil {
+					cfg["outbounds"] = append(outbounds, fragOutbound)
 				}
 			}
 
@@ -530,12 +697,16 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 			},
 		}
 
+		sockopt := map[string]interface{}{
+			"mark": 255,
+		}
+		if fragOutbound != nil {
+			sockopt["dialerProxy"] = "fragment"
+		}
+
 		streamSettings := map[string]interface{}{
 			"network": node.Transport,
-			// Mark outbound packets to bypass any potential routing loops
-			"sockopt": map[string]interface{}{
-				"mark": 255,
-			},
+			"sockopt": sockopt,
 		}
 		if streamSettings["network"] == "" {
 			streamSettings["network"] = "tcp"
@@ -575,6 +746,13 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 		outbound["streamSettings"] = streamSettings
 
 	case "shadowsocks":
+		sockopt := map[string]interface{}{
+			"mark": 255,
+		}
+		if fragOutbound != nil {
+			sockopt["dialerProxy"] = "fragment"
+		}
+
 		outbound["protocol"] = "shadowsocks"
 		outbound["settings"] = map[string]interface{}{
 			"servers": []map[string]interface{}{
@@ -587,12 +765,17 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 			},
 		}
 		outbound["streamSettings"] = map[string]interface{}{
-			"sockopt": map[string]interface{}{
-				"mark": 255,
-			},
+			"sockopt": sockopt,
 		}
 
 	case "trojan":
+		sockopt := map[string]interface{}{
+			"mark": 255,
+		}
+		if fragOutbound != nil {
+			sockopt["dialerProxy"] = "fragment"
+		}
+
 		outbound["protocol"] = "trojan"
 		outbound["settings"] = map[string]interface{}{
 			"servers": []map[string]interface{}{
@@ -608,29 +791,51 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 			"tlsSettings": map[string]interface{}{
 				"serverName": node.Details["sni"],
 			},
-			"sockopt": map[string]interface{}{
-				"mark": 255,
-			},
+			"sockopt": sockopt,
 		}
 
 	default:
 		outbound["protocol"] = "freedom"
 	}
 
+	if muxBlock != nil && proto != "freedom" {
+		outbound["mux"] = muxBlock
+	}
+
+	socksIn := map[string]interface{}{
+		"port":     2080,
+		"listen":   "127.0.0.1",
+		"protocol": "socks",
+		"settings": map[string]interface{}{
+			"udp":  true,
+			"auth": "noauth",
+		},
+	}
+	if e.advConfig.EnableSniffing {
+		socksIn["sniffing"] = map[string]interface{}{
+			"enabled":      true,
+			"destOverride": []string{"http", "tls", "quic"},
+		}
+	}
+
+	outboundsList := []map[string]interface{}{outbound}
+	if fragOutbound != nil {
+		outboundsList = append(outboundsList, fragOutbound)
+	}
+	outboundsList = append(outboundsList, map[string]interface{}{
+		"protocol": "freedom",
+		"tag":      "direct",
+		"settings": map[string]interface{}{
+			"domainStrategy": mapIPTypeToXrayStrategy(e.ipType),
+		},
+	})
+
 	config := map[string]interface{}{
 		"log": map[string]interface{}{
 			"loglevel": "warning",
 		},
 		"inbounds": []map[string]interface{}{
-			{
-				"port":     2080,
-				"listen":   "127.0.0.1",
-				"protocol": "socks",
-				"settings": map[string]interface{}{
-					"udp":  true,
-					"auth": "noauth",
-				},
-			},
+			socksIn,
 			{
 				"port":     2081,
 				"listen":   "127.0.0.1",
@@ -640,13 +845,7 @@ func (e *Engine) generateXrayConfig(node *model.ProxyNode) ([]byte, error) {
 				},
 			},
 		},
-		"outbounds": []map[string]interface{}{
-			outbound,
-			{
-				"protocol": "freedom",
-				"tag":      "direct",
-			},
-		},
+		"outbounds": outboundsList,
 	}
 
 	return json.MarshalIndent(config, "", "  ")
@@ -818,7 +1017,16 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 		"outbound":     "direct",
 	})
 
-	// 4. Direct route for the proxy server itself to prevent routing loops
+	// 4. Inbound traffic sniffing for VPN routed traffic
+	if e.advConfig.EnableSniffing {
+		rules = append(rules, map[string]interface{}{
+			"action":  "sniff",
+			"sniffer": []string{"http", "tls", "quic"},
+			"timeout": "300ms",
+		})
+	}
+
+	// 5. Direct route for the proxy server itself to prevent routing loops
 	if len(excludeAddrs) > 0 {
 		rules = append(rules, map[string]interface{}{
 			"ip_cidr":  excludeAddrs,
@@ -890,10 +1098,55 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 		"tag":  "direct",
 	}
 
+	dnsStrategy := string(e.ipType)
+	if dnsStrategy == "" {
+		dnsStrategy = string(model.IPTypePreferIPv4)
+	}
+
+	var dnsServers []map[string]interface{}
+	resolveTag := "remote-doh-cf"
+
+	if e.advConfig.EnableResolveServer {
+		ip := strings.TrimSpace(e.advConfig.ResolveServerIP)
+		if ip == "" {
+			ip = "1.1.1.1"
+		}
+		dnsServers = append(dnsServers, map[string]interface{}{
+			"tag":    "remote-doh",
+			"type":   "https",
+			"server": ip,
+			"detour": "proxy",
+		})
+		resolveTag = "remote-doh"
+	} else {
+		dnsServers = append(dnsServers, map[string]interface{}{
+			"tag":    "remote-doh-cf",
+			"type":   "https",
+			"server": "1.1.1.1",
+			"detour": "proxy",
+		})
+	}
+
+	dnsServers = append(dnsServers, map[string]interface{}{
+		"tag":    "remote-doh-google",
+		"type":   "https",
+		"server": "8.8.8.8",
+		"detour": "proxy",
+	})
+
+	if e.advConfig.UseLocalDNS {
+		dnsServers = append(dnsServers, map[string]interface{}{
+			"tag":    "local-dns",
+			"type":   "local",
+			"detour": "direct",
+		})
+		directOutbound["domain_resolver"] = "local-dns"
+	}
+
 	routeBlock := map[string]interface{}{
 		"find_process":            true,
 		"auto_detect_interface":   true,
-		"default_domain_resolver": "remote-doh-cf",
+		"default_domain_resolver": resolveTag,
 		"rules":                   rules,
 	}
 	if len(ruleSetBlocks) > 0 {
@@ -909,22 +1162,9 @@ func (e *Engine) generateSingboxConfig(node *model.ProxyNode, bypassList []strin
 			"level": "info",
 		},
 		"dns": map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"tag":    "remote-doh-cf",
-					"type":   "https",
-					"server": "1.1.1.1",
-					"detour": "proxy",
-				},
-				{
-					"tag":    "remote-doh-google",
-					"type":   "https",
-					"server": "8.8.8.8",
-					"detour": "proxy",
-				},
-			},
-			"final":    "remote-doh-cf",
-			"strategy": "prefer_ipv4",
+			"servers":  dnsServers,
+			"final":    resolveTag,
+			"strategy": dnsStrategy,
 		},
 		"inbounds": []map[string]interface{}{tunInbound},
 		"outbounds": []map[string]interface{}{

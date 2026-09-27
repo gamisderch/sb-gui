@@ -189,3 +189,189 @@ func TestVirtualInterfaceDetection(t *testing.T) {
 		}
 	}
 }
+
+func TestXrayFragmentationAndMux(t *testing.T) {
+	e := NewEngine()
+	e.fragConfig = model.FragmentationConfig{
+		Enabled:  true,
+		Packets:  "tlshello",
+		Length:   "100-200",
+		Interval: "10-20",
+	}
+	e.muxConfig = model.MuxConfig{
+		Enabled:         true,
+		Concurrency:     16,
+		XUDPConcurrency: 32,
+		XUDPProxyUDP443: "reject",
+	}
+	e.ipType = model.IPTypeIPv4Only
+	e.advConfig.EnableSniffing = true
+
+	node := &model.ProxyNode{
+		ID:        "node-trojan",
+		Name:      "Trojan Node",
+		Protocol:  "trojan",
+		Address:   "1.2.3.4",
+		Port:      443,
+		Security:  "tls",
+		Transport: "tcp",
+		Details: map[string]string{
+			"password": "secretpassword",
+			"sni":      "example.com",
+		},
+	}
+
+	cfgBytes, err := e.generateXrayConfig(node)
+	if err != nil {
+		t.Fatalf("generateXrayConfig failed: %v", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		t.Fatalf("failed to parse xray json: %v", err)
+	}
+
+	outbounds, ok := cfg["outbounds"].([]interface{})
+	if !ok {
+		t.Fatalf("missing outbounds in xray config")
+	}
+
+	// 1. Verify fragment outbound exists
+	foundFragment := false
+	for _, ob := range outbounds {
+		obMap, ok := ob.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if obMap["tag"] == "fragment" {
+			foundFragment = true
+			settings, ok := obMap["settings"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("fragment outbound missing settings")
+			}
+			frag, ok := settings["fragment"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("fragment settings missing fragment block")
+			}
+			if frag["packets"] != "tlshello" || frag["length"] != "100-200" || frag["interval"] != "10-20" {
+				t.Errorf("unexpected fragment values: %v", frag)
+			}
+		}
+	}
+	if !foundFragment {
+		t.Errorf("expected fragment outbound to be present")
+	}
+
+	// 2. Verify proxy outbound has dialerProxy and mux
+	proxyOb := outbounds[0].(map[string]interface{})
+	streamSettings, ok := proxyOb["streamSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("proxy outbound missing streamSettings")
+	}
+	sockopt, ok := streamSettings["sockopt"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("streamSettings missing sockopt")
+	}
+	if sockopt["dialerProxy"] != "fragment" {
+		t.Errorf("expected dialerProxy to be 'fragment', got %v", sockopt["dialerProxy"])
+	}
+
+	mux, ok := proxyOb["mux"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("proxy outbound missing mux block")
+	}
+	if mux["enabled"] != true || mux["concurrency"] != float64(16) || mux["xudpConcurrency"] != float64(32) || mux["xudpProxyUDP443"] != "reject" {
+		t.Errorf("unexpected mux settings: %v", mux)
+	}
+
+	// 3. Verify sniffing on inbound socks 2080
+	inbounds, ok := cfg["inbounds"].([]interface{})
+	if !ok || len(inbounds) == 0 {
+		t.Fatalf("missing inbounds")
+	}
+	socksIn := inbounds[0].(map[string]interface{})
+	sniffing, ok := socksIn["sniffing"].(map[string]interface{})
+	if !ok || sniffing["enabled"] != true {
+		t.Errorf("expected sniffing enabled on socks inbound")
+	}
+}
+
+func TestSingboxAdvancedSettings(t *testing.T) {
+	e := NewEngine()
+	e.advConfig = model.AdvancedTunnelConfig{
+		UseLocalDNS:         true,
+		UseDNSFromJSON:      false,
+		EnableResolveServer: true,
+		ResolveServerIP:     "9.9.9.9",
+		ResolveServerDomain: "https://dns.quad9.net/dns-query",
+		EnableSniffing:      true,
+	}
+	e.ipType = model.IPTypeIPv6Only
+
+	node := &model.ProxyNode{
+		ID:       "test-node",
+		Name:     "Test Node",
+		Protocol: "vless",
+		Address:  "198.51.100.1",
+		Port:     443,
+	}
+
+	cfgBytes, err := e.generateSingboxConfig(node, []string{"mock.exe"}, nil)
+	if err != nil {
+		t.Fatalf("generateSingboxConfig failed: %v", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		t.Fatalf("failed to parse sing-box json: %v", err)
+	}
+
+	dns, ok := cfg["dns"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("missing dns block")
+	}
+	if dns["strategy"] != "ipv6_only" {
+		t.Errorf("expected dns strategy to be ipv6_only, got %v", dns["strategy"])
+	}
+	if dns["final"] != "remote-doh" {
+		t.Errorf("expected final dns resolver to be remote-doh, got %v", dns["final"])
+	}
+
+	servers, ok := dns["servers"].([]interface{})
+	if !ok {
+		t.Fatalf("missing dns.servers")
+	}
+
+	foundLocal := false
+	foundCustomDoH := false
+	for _, s := range servers {
+		sMap := s.(map[string]interface{})
+		if sMap["tag"] == "local-dns" && sMap["type"] == "local" {
+			foundLocal = true
+		}
+		if sMap["tag"] == "remote-doh" && sMap["server"] == "9.9.9.9" {
+			foundCustomDoH = true
+		}
+	}
+	if !foundLocal {
+		t.Errorf("expected local-dns server in dns.servers when UseLocalDNS is true")
+	}
+	if !foundCustomDoH {
+		t.Errorf("expected remote-doh with IP 9.9.9.9 in dns.servers")
+	}
+
+	// Verify route rules contain sniffing
+	route := cfg["route"].(map[string]interface{})
+	rules := route["rules"].([]interface{})
+	foundSniff := false
+	for _, r := range rules {
+		rMap := r.(map[string]interface{})
+		if rMap["action"] == "sniff" {
+			foundSniff = true
+			break
+		}
+	}
+	if !foundSniff {
+		t.Errorf("expected sniff rule in route.rules when EnableSniffing is true")
+	}
+}

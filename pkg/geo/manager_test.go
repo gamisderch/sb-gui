@@ -97,3 +97,48 @@ func TestExportAndCompileWithSampleDB(t *testing.T) {
 		t.Errorf("compiled SRS file does not exist: %v", err)
 	}
 }
+
+func TestEnsureRuleSetsWithCustomRules(t *testing.T) {
+	singboxBin, _ := filepath.Abs("../../bin/sing-box")
+	if _, err := os.Stat(singboxBin); err != nil {
+		singboxBin, _ = filepath.Abs("./bin/sing-box")
+		if _, err := os.Stat(singboxBin); err != nil {
+			t.Skip("sing-box binary not found, skipping compile test")
+		}
+	}
+
+	tmpDir := t.TempDir()
+	m := &Manager{
+		baseDir:       tmpDir,
+		cachedSiteMap: make(map[string]bool),
+		cachedIPMap:   make(map[string]bool),
+	}
+	_ = os.MkdirAll(filepath.Join(tmpDir, "rules"), 0755)
+
+	rules := []*model.GeoRule{
+		{Type: model.GeoTypeSite, Name: "vk.com", Action: model.GeoActionDirect},
+		{Type: model.GeoTypeSite, Name: "yandex.ru", Action: model.GeoActionDirect},
+		{Type: model.GeoTypeIP, Name: "0.0.0.0/8", Action: model.GeoActionDirect},
+		{Type: model.GeoTypeIP, Name: "5.45.192.0/18", Action: model.GeoActionDirect},
+		{Type: model.GeoTypeSite, Name: "blocked-ads.com", Action: model.GeoActionBlock},
+	}
+
+	metas, err := m.EnsureRuleSets(singboxBin, rules)
+	if err != nil {
+		t.Fatalf("EnsureRuleSets failed: %v", err)
+	}
+
+	if len(metas) != 2 { // custom-direct and custom-block
+		t.Fatalf("expected 2 metas, got %d", len(metas))
+	}
+
+	for _, meta := range metas {
+		if !meta.IsBinary {
+			t.Errorf("expected binary rule set for %s", meta.Tag)
+		}
+		if _, err := os.Stat(meta.Path); err != nil {
+			t.Errorf("rule set file not found: %s", meta.Path)
+		}
+	}
+}
+

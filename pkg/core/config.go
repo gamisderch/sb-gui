@@ -10,13 +10,17 @@ import (
 
 // ConfigData stores saved user preferences, subscriptions and bypass list
 type ConfigData struct {
-	UserAgent     string                `json:"user_agent"`
-	Mode          model.TunnelMode      `json:"mode"`
-	ActiveNodeID  string                `json:"active_node_id"`
-	Subscriptions []*model.Subscription `json:"subscriptions"`
-	BypassNames   []string              `json:"bypass_names"`
-	ThemeColors   map[string]string     `json:"theme_colors,omitempty"`
-	GeoRules      []*model.GeoRule      `json:"geo_rules,omitempty"`
+	UserAgent     string                     `json:"user_agent"`
+	Mode          model.TunnelMode           `json:"mode"`
+	ActiveNodeID  string                     `json:"active_node_id"`
+	Subscriptions []*model.Subscription      `json:"subscriptions"`
+	BypassNames   []string                   `json:"bypass_names"`
+	ThemeColors   map[string]string          `json:"theme_colors,omitempty"`
+	GeoRules      []*model.GeoRule           `json:"geo_rules,omitempty"`
+	IPType        model.IPTypePreference     `json:"ip_type,omitempty"`
+	Fragmentation model.FragmentationConfig  `json:"fragmentation,omitempty"`
+	Mux           model.MuxConfig            `json:"mux,omitempty"`
+	Advanced      model.AdvancedTunnelConfig `json:"advanced,omitempty"`
 }
 
 // GetConfigPath returns ~/.config/sb-cli/config.json
@@ -60,8 +64,11 @@ func SaveConfig(state *model.AppState, bypassNames map[string]bool) error {
 		BypassNames:   names,
 		ThemeColors:   state.ThemeColors,
 		GeoRules:      state.GeoRules,
+		IPType:        state.IPType,
+		Fragmentation: state.Fragmentation,
+		Mux:           state.Mux,
+		Advanced:      state.Advanced,
 	}
-
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -86,6 +93,20 @@ func LoadConfig() (*ConfigData, error) {
 	var cfg ConfigData
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+
+	// Apply defaults for any missing configuration fields
+	if cfg.IPType == "" {
+		cfg.IPType = model.IPTypePreferIPv4
+	}
+	if cfg.Fragmentation.Packets == "" {
+		cfg.Fragmentation = model.DefaultFragmentationConfig()
+	}
+	if cfg.Mux.Concurrency == 0 {
+		cfg.Mux = model.DefaultMuxConfig()
+	}
+	if cfg.Advanced.ResolveServerIP == "" {
+		cfg.Advanced = model.DefaultAdvancedTunnelConfig()
 	}
 
 	return &cfg, nil

@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+
+	"signbox-cli/pkg/model"
 )
 
 func TestParseVlessURI(t *testing.T) {
@@ -252,5 +254,158 @@ func TestLivePandaFetch(t *testing.T) {
 
 	t.Logf("Successfully fetched %d nodes from Panda subscription! First node: %s (%s, %s:%d)",
 		len(sub.Nodes), sub.Nodes[0].Name, sub.Nodes[0].Protocol, sub.Nodes[0].Address, sub.Nodes[0].Port)
+}
+
+func TestParseContentWithRules(t *testing.T) {
+	clashYamlWithRules := `
+proxies:
+  - name: "Node-1"
+    type: vless
+    server: 1.2.3.4
+    port: 443
+    uuid: test-uuid
+    tls: true
+rules:
+  - GEOSITE,category-ads-all,REJECT
+  - GEOSITE,youtube,Proxy
+  - GEOSITE,google,Proxy
+  - GEOSITE,ru,DIRECT
+  - GEOIP,RU,DIRECT
+  - GEOIP,telegram,Proxy
+  - MATCH,DIRECT
+`
+	nodes, rules, err := ParseContentWithRules(clashYamlWithRules, "ClashRules")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if len(rules) != 6 {
+		t.Fatalf("expected 6 rules, got %d", len(rules))
+	}
+
+	// Verify rule details
+	expectedRules := map[string]struct {
+		rType  model.GeoRuleType
+		action model.GeoRuleAction
+	}{
+		"category-ads-all": {model.GeoTypeSite, model.GeoActionBlock},
+		"youtube":          {model.GeoTypeSite, model.GeoActionProxy},
+		"google":           {model.GeoTypeSite, model.GeoActionProxy},
+		"ru":               {model.GeoTypeSite, model.GeoActionDirect},
+		"telegram":         {model.GeoTypeIP, model.GeoActionProxy},
+	}
+
+	for _, r := range rules {
+		if exp, ok := expectedRules[r.Name]; ok && exp.rType == r.Type {
+			if r.Action != exp.action {
+				t.Errorf("rule %s action mismatch: expected %v, got %v", r.Name, exp.action, r.Action)
+			}
+		}
+	}
+
+	// Test JSON routing rules
+	jsonConfig := `{
+		"outbounds": [
+			{"type": "vless", "tag": "proxy", "server": "1.1.1.1", "server_port": 443, "uuid": "test"}
+		],
+		"route": {
+			"rules": [
+				{"geosite": ["category-ads-all"], "outbound": "block"},
+				{"geosite": "openai", "outbound": "proxy"},
+				{"geoip": ["ru", "by"], "outbound": "direct"},
+				{"rule_set": ["geosite-youtube", "geoip-cn"], "outbound": "proxy"}
+			]
+		}
+	}`
+
+	jNodes, jRules, err := ParseContentWithRules(jsonConfig, "JSONSub")
+	if err != nil {
+		t.Fatalf("unexpected json error: %v", err)
+	}
+	if len(jNodes) != 1 {
+		t.Fatalf("expected 1 jNode, got %d", len(jNodes))
+	}
+	if len(jRules) != 6 { // category-ads-all, openai, ru, by, youtube, cn
+		t.Fatalf("expected 6 jRules, got %d", len(jRules))
+	}
+}
+
+func TestParseRemnawaveXrayDomainAndIPRules(t *testing.T) {
+	raw := `{
+		"remarks": "🇵🇱⚡Польша",
+		"outbounds": [
+			{
+				"tag": "proxy",
+				"protocol": "vless",
+				"settings": {
+					"vnext": [{"address": "pol1.pandaonline.org", "port": 443, "users": [{"id": "uuid-123"}]}]
+				}
+			}
+		],
+		"routing": {
+			"rules": [
+				{
+					"outboundTag": "direct",
+					"protocol": ["bittorrent"]
+				},
+				{
+					"ip": [
+						"0.0.0.0/8",
+						"10.0.0.0/8",
+						"5.45.192.0/18",
+						"geoip:ru",
+						"84.201.151.229"
+					],
+					"outboundTag": "direct"
+				},
+				{
+					"domain": [
+						"moscow",
+						"ru",
+						"su",
+						"vk.com",
+						"geosite:category-ru",
+						"domain:yandex.ru"
+					],
+					"outboundTag": "direct"
+				}
+			]
+		}
+	}`
+
+	nodes, rules, err := ParseContentWithRules(raw, "PandaVPN")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+
+	// Total rules: 5 IP rules + 6 domain rules = 11
+	if len(rules) != 11 {
+		t.Fatalf("expected 11 rules, got %d", len(rules))
+	}
+
+	siteCount := 0
+	ipCount := 0
+	for _, r := range rules {
+		if r.Action != model.GeoActionDirect {
+			t.Errorf("expected direct action, got %v for rule %s", r.Action, r.Name)
+		}
+		if r.Type == model.GeoTypeSite {
+			siteCount++
+		} else if r.Type == model.GeoTypeIP {
+			ipCount++
+		}
+	}
+
+	if siteCount != 6 {
+		t.Errorf("expected 6 site rules, got %d", siteCount)
+	}
+	if ipCount != 5 {
+		t.Errorf("expected 5 IP rules, got %d", ipCount)
+	}
 }
 

@@ -10,7 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// RenderSettingsView renders the settings and config screen
+// RenderSettingsView renders the redesigned settings screen with App Settings and Tunnel Settings sections
 func (m *Model) RenderSettingsView() string {
 	width := m.width
 	height := m.height - 2
@@ -35,108 +35,27 @@ func (m *Model) RenderSettingsView() string {
 	var innerLines []string
 	innerLines = append(innerLines, emptyBlackLine(innerWidth))
 
-	// Section 0: Theme & Color Studio
-	themeHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [1] Theme & Color Customizer (RGB Sliders & Live Preview)")
-	innerLines = append(innerLines, padLine(themeHdr, innerWidth))
+	// =========================================================================
+	// SECTION 1: APP SETTINGS
+	// =========================================================================
+	appHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [1] APP SETTINGS")
+	innerLines = append(innerLines, padLine(appHdr, innerWidth))
 
-	themeText := "      ▶ [Open Theme Studio] Customize Palette, 3 RGB Sliders & Real-time Preview (Press ↵ or [t])"
+	// Item 0: Theme & Color Studio
+	themeText := "      ▶ [Theme & Color Studio] Customize Palette, 3 RGB Sliders & Live Preview (Press ↵ or [t])"
 	if m.settingsCursor == 0 {
 		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(themeText), innerWidth))
 	} else {
 		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Render(themeText), innerWidth))
 	}
-	innerLines = append(innerLines, emptyBlackLine(innerWidth))
 
-	// Section 1: User-Agent Spoofing
-	uaHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [2] Subscription User-Agent (Anti-blocking)")
-	innerLines = append(innerLines, padLine(uaHdr, innerWidth))
-	userAgents := []string{
-		"Happ/1.8.0 (Linux; x86_64) [Recommended]",
-		"clash-meta/1.18.0",
-		"v2rayN/6.23",
-		"Sing-box/1.10.0",
-	}
-
-	for i, ua := range userAgents {
-		cursor := "      ○ "
-		if i == m.settingsUAIdx {
-			cursor = "      ● "
-		}
-		text := fmt.Sprintf("%s%s", cursor, ua)
-		if m.settingsCursor == 1 && i == m.settingsUAIdx {
-			innerLines = append(innerLines, padLine(StyleSelectedRow.Render(text), innerWidth))
-		} else {
-			innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(text), innerWidth))
-		}
-	}
-
-	// Custom UA item
-	customCursor := "      ○ "
-	if m.settingsUAIdx == 4 {
-		customCursor = "      ● "
-	}
-	var customText string
-	if m.customUAActive {
-		customText = fmt.Sprintf("      ▶ Custom: %s (Enter to save, Esc to cancel)", m.customUATextInput.View())
-	} else {
-		customVal := m.state.UserAgent
-		if customVal == "" {
-			customVal = "(not set)"
-		}
-		customText = fmt.Sprintf("%sCustom: %s [Press ↵ or 'e' to edit]", customCursor, customVal)
-	}
-	if m.settingsCursor == 1 && m.settingsUAIdx == 4 {
-		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(customText), innerWidth))
-	} else {
-		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(customText), innerWidth))
-	}
-	innerLines = append(innerLines, emptyBlackLine(innerWidth))
-
-	// Section 2: Routing Mode
-	modeHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [3] Routing / Tunnel Mode")
-	innerLines = append(innerLines, padLine(modeHdr, innerWidth))
-	modes := []model.TunnelMode{
-		model.ModeTUN,
-		model.ModeSystemProxy,
-		model.ModeDirect,
-	}
-
-	for i, mode := range modes {
-		cursor := "      ○ "
-		if mode == m.state.Mode {
-			cursor = "      ● "
-		}
-		text := fmt.Sprintf("%s%s", cursor, string(mode))
-		if m.settingsCursor == 2 && i == m.settingsModeIdx {
-			innerLines = append(innerLines, padLine(StyleSelectedRow.Render(text), innerWidth))
-		} else {
-			innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(text), innerWidth))
-		}
-	}
-	innerLines = append(innerLines, emptyBlackLine(innerWidth))
-
-	// Section 3: GeoSite & GeoIP Rules
-	geoHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [4] Geo Routing Rules & Database Sync (GeoSite / GeoIP)")
-	innerLines = append(innerLines, padLine(geoHdr, innerWidth))
-	rulesCount := len(m.state.GeoRules)
-	geoText := fmt.Sprintf("      ▶ [Open Geo Rules Manager] Direct/Proxy/Block rules & DB Sync (%d active rules) (Press ↵ or [g])", rulesCount)
-	if m.settingsCursor == 3 {
-		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(geoText), innerWidth))
-	} else {
-		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Render(geoText), innerWidth))
-	}
-	innerLines = append(innerLines, emptyBlackLine(innerWidth))
-
-	// Section 4: Background Daemon & Systemd Integration
-	daemonHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [5] Background Daemon & System Autostart")
-	innerLines = append(innerLines, padLine(daemonHdr, innerWidth))
-
+	// Item 1: Background Daemon & Systemd Autostart
 	systemdStatus := "Disabled"
 	if core.IsSystemdServiceEnabled() {
 		systemdStatus = "Enabled"
 	}
-	systemdText := fmt.Sprintf("      ▶ Auto-start on boot (systemd --user): [%s] (Press ↵ to toggle)", systemdStatus)
-	if m.settingsCursor == 4 {
+	systemdText := fmt.Sprintf("      ▶ [Auto-start on Boot (systemd --user)] Current: [%s] (Press ↵ to toggle)", systemdStatus)
+	if m.settingsCursor == 1 {
 		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(systemdText), innerWidth))
 	} else {
 		statusColor := ColorMuted
@@ -145,33 +64,114 @@ func (m *Model) RenderSettingsView() string {
 		}
 		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(statusColor).Background(ColorBg).Render(systemdText), innerWidth))
 	}
+
+	// Item 2: Subscription User-Agent
+	var uaSummary string
+	if m.customUAActive {
+		uaSummary = fmt.Sprintf("      ▶ Custom UA: %s (Enter to save, Esc to cancel)", m.customUATextInput.View())
+	} else {
+		currentUA := m.state.UserAgent
+		if currentUA == "" {
+			currentUA = "Happ/1.8.0 (Linux; x86_64)"
+		}
+		uaSummary = fmt.Sprintf("      ▶ [Subscription User-Agent] %s [Press ↵ to cycle, 'e' to edit]", currentUA)
+	}
+	if m.settingsCursor == 2 {
+		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(uaSummary), innerWidth))
+	} else {
+		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(uaSummary), innerWidth))
+	}
 	innerLines = append(innerLines, emptyBlackLine(innerWidth))
 
-	// Section 5: DNS Protection
-	dnsHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [6] DNS Leak Shield")
-	dnsDesc := lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render("      Redirect UDP/TCP 53 -> 127.0.0.1:6450 (Sing-box Local DNS Resolver)")
-	dnsStatusLbl := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("      Status: ")
-	dnsStatusVal := StyleSuccess.Render("Protected (Policy routing active)")
+	// =========================================================================
+	// SECTION 2: TUNNEL SETTINGS
+	// =========================================================================
+	tunnelHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [2] TUNNEL SETTINGS")
+	innerLines = append(innerLines, padLine(tunnelHdr, innerWidth))
 
-	innerLines = append(innerLines,
-		padLine(dnsHdr, innerWidth),
-		padLine(dnsDesc, innerWidth),
-		padLine(dnsStatusLbl+dnsStatusVal, innerWidth),
-	)
+	// Item 3: Routing / Tunnel Mode
+	modeText := fmt.Sprintf("      ▶ [Tunnel Mode] Current: %s (Press ↵ or Space to cycle TUN/Proxy/Direct)", m.state.Mode)
+	if m.settingsCursor == 3 {
+		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(modeText), innerWidth))
+	} else {
+		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(modeText), innerWidth))
+	}
+
+	// Item 4: Preferred IP Type
+	ipTypeLabel := "Prefer IPv4 (Recommended)"
+	switch m.state.IPType {
+	case model.IPTypePreferIPv6:
+		ipTypeLabel = "Prefer IPv6"
+	case model.IPTypeIPv4Only:
+		ipTypeLabel = "IPv4 Only"
+	case model.IPTypeIPv6Only:
+		ipTypeLabel = "IPv6 Only"
+	}
+	ipTypeText := fmt.Sprintf("      ▶ [Preferred IP Type] Strategy: %s (Press ↵ or Space to cycle)", ipTypeLabel)
+	if m.settingsCursor == 4 {
+		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(ipTypeText), innerWidth))
+	} else {
+		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorWhite).Background(ColorBg).Render(ipTypeText), innerWidth))
+	}
+
+	// Item 5: GeoSite & GeoIP Rules
+	rulesCount := len(m.state.GeoRules)
+	subProfiles := len(m.state.Subscriptions)
+	geoText := fmt.Sprintf("      ▶ [GeoSite & GeoIP Rules] Direct/Proxy/Block rules & DB Sync (%d global, %d subs) (Press ↵ or [g])", rulesCount, subProfiles)
+	if m.settingsCursor == 5 {
+		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(geoText), innerWidth))
+	} else {
+		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorSuccess).Background(ColorBg).Render(geoText), innerWidth))
+	}
+
+	// Item 6: TLS Packet Fragmentation
+	fragStatus := "Disabled"
+	if m.state.Fragmentation.Enabled {
+		fragStatus = "Enabled"
+	}
+	fragText := fmt.Sprintf("      ▶ [TLS Packet Fragmentation] Status: [%s] (Packets: %s, Length: %s, Delay: %sms) [Space=toggle, ↵=configure]",
+		fragStatus, m.state.Fragmentation.Packets, m.state.Fragmentation.Length, m.state.Fragmentation.Interval)
+	if m.settingsCursor == 6 {
+		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(fragText), innerWidth))
+	} else {
+		statusColor := ColorMuted
+		if m.state.Fragmentation.Enabled {
+			statusColor = ColorSuccess
+		}
+		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(statusColor).Background(ColorBg).Render(fragText), innerWidth))
+	}
+
+	// Item 7: TCP / UDP Multiplexing (Mux)
+	muxStatus := "Disabled"
+	if m.state.Mux.Enabled {
+		muxStatus = "Enabled"
+	}
+	muxText := fmt.Sprintf("      ▶ [TCP/UDP Multiplexing (Mux)] Status: [%s] (Concurrency: %d, XUDP: %d, UDP443: %s) [Space=toggle, ↵=configure]",
+		muxStatus, m.state.Mux.Concurrency, m.state.Mux.XUDPConcurrency, m.state.Mux.XUDPProxyUDP443)
+	if m.settingsCursor == 7 {
+		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(muxText), innerWidth))
+	} else {
+		statusColor := ColorMuted
+		if m.state.Mux.Enabled {
+			statusColor = ColorSuccess
+		}
+		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(statusColor).Background(ColorBg).Render(muxText), innerWidth))
+	}
+
+	// Item 8: Advanced Settings
+	advText := "      ▶ [Advanced Settings] DNS Resolvers, Local DNS, JSON DNS & Inbound Sniffing (Press ↵ to open)"
+	if m.settingsCursor == 8 {
+		innerLines = append(innerLines, padLine(StyleSelectedRow.Render(advText), innerWidth))
+	} else {
+		innerLines = append(innerLines, padLine(lipgloss.NewStyle().Foreground(ColorSecondary).Background(ColorBg).Bold(true).Render(advText), innerWidth))
+	}
 	innerLines = append(innerLines, emptyBlackLine(innerWidth))
 
-	// Section 6: System Privileges & cgroup status
-	sysHdr := lipgloss.NewStyle().Bold(true).Foreground(ColorSecondary).Background(ColorBg).Render("  [7] Kernel & cgroup v2 Status")
-	cgroupLine := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("      cgroup path:   /sys/fs/cgroup/game-vpn")
-	nftLine := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("      nftables:      inet game_tunnel (mangle output + nat redirect)")
-	ipRuleLine := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render("      ip rule:       fwmark 0x50 lookup 100 priority 1000")
-
-	innerLines = append(innerLines,
-		padLine(sysHdr, innerWidth),
-		padLine(cgroupLine, innerWidth),
-		padLine(nftLine, innerWidth),
-		padLine(ipRuleLine, innerWidth),
+	// System & Status line
+	statusLine := lipgloss.NewStyle().Foreground(ColorMuted).Background(ColorBg).Render(
+		"  cgroup v2: /sys/fs/cgroup/game-vpn │ nftables: inet game_tunnel │ DNS Shield: UDP/TCP 53 -> DoH",
 	)
+	innerLines = append(innerLines, padLine(statusLine, innerWidth))
 
 	// Pad or truncate
 	for len(innerLines) < height-2 {

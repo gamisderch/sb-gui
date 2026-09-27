@@ -78,18 +78,18 @@ func (m *Model) renderServersPanel(width, height int) string {
 	totalItems := len(items)
 
 	// Subheader info: Show current group & traffic if selected, or filter/add hint
-	subHeaderStr := "  [F] Filter  [A] Add  [E] Collapse All"
+	subHeaderStr := "  [f] Filter  [a] Add  [e] Collapse  [J/K] Move  [d/Del] Delete"
 	if totalItems > 0 && m.selectedNodeIdx < totalItems {
 		currItem := items[m.selectedNodeIdx]
 		if currItem.IsHeader {
 			trafficStr := currItem.Sub.FormatTraffic()
+			collapseHint := "[e] Collapse"
 			if currItem.Collapsed {
-				subHeaderStr = fmt.Sprintf("  ▶ [%s] %s  [Enter/Space/e] Expand", currItem.Sub.Name, trafficStr)
-			} else {
-				subHeaderStr = fmt.Sprintf("  ▼ [%s] %s  [Enter/Space/e] Collapse", currItem.Sub.Name, trafficStr)
+				collapseHint = "[e] Expand"
 			}
+			subHeaderStr = fmt.Sprintf("  [%s] %s  %s  [J/K] Move  [d/Del] Delete", currItem.Sub.Name, trafficStr, collapseHint)
 		} else if currItem.Sub != nil {
-			subHeaderStr = fmt.Sprintf("  ▼ [%s] %s  [Enter] Connect  [e] Collapse", currItem.Sub.Name, currItem.Sub.FormatTraffic())
+			subHeaderStr = fmt.Sprintf("  ▼ [%s] %s  [Enter] Connect  [e] Header", currItem.Sub.Name, currItem.Sub.FormatTraffic())
 		}
 	}
 	if lipgloss.Width(subHeaderStr) > innerWidth {

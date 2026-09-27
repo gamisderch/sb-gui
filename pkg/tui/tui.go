@@ -29,6 +29,9 @@ const (
 	ViewTheme
 	ViewGeoRules
 	ViewLogs
+	ViewAdvancedSettings
+	ViewFragmentation
+	ViewMux
 )
 
 // Model is the main bubbletea state
@@ -81,6 +84,19 @@ type Model struct {
 	customUAActive    bool
 	customUATextInput textinput.Model
 
+	// Advanced Settings state
+	advCursor      int
+	advInputActive bool
+	advTextInput   textinput.Model
+
+	// Fragmentation Studio state
+	fragCursor      int
+	fragInputActive bool
+	fragTextInput   textinput.Model
+
+	// Mux Studio state
+	muxCursor int
+
 	// Theme Studio state
 	themeCursor       int  // Index in getThemeElements()
 	themeSliderActive bool // true = adjusting RGB sliders, false = browsing elements
@@ -90,9 +106,12 @@ type Model struct {
 	themeB            int  // Current Blue (0..255)
 
 	// Geo Rules & Sync state
-	geoInActionView bool // false = Level 1 (Direct/Proxy/Block menu), true = Level 2 (Action view)
-	geoActionIdx    int  // 0 = Direct, 1 = Proxy, 2 = Block
+	geoInProfileView bool // false = Level 0 (Profile Selection), true = Level 1 (Direct/Proxy/Block menu)
+	geoProfileIdx    int  // 0 = Global / Default, 1..N = Subscriptions[0..N-1]
+	geoInActionView  bool // false = Level 1 (Direct/Proxy/Block menu), true = Level 2 (Action view)
+	geoActionIdx     int  // 0 = Direct, 1 = Proxy, 2 = Block
 	geoRuleCursor   int  // selected rule in Level 2 table
+	geoRuleScroll   int  // scroll offset in Level 2 table
 	geoCursor       int  // legacy
 	geoModeAdd      bool
 	geoTab          int // 0 = GeoSite, 1 = GeoIP
@@ -128,6 +147,33 @@ func NewModel(state *model.AppState, procMgr *process.ProcessManager, engine *co
 	uaInput.CharLimit = 512
 	uaInput.Width = 50
 
+	advInput := textinput.New()
+	advInput.CharLimit = 256
+	advInput.Width = 40
+
+	fragInput := textinput.New()
+	fragInput.CharLimit = 64
+	fragInput.Width = 30
+
+	if state != nil {
+		if state.IPType == "" {
+			state.IPType = model.IPTypePreferIPv4
+		}
+		if state.Fragmentation.Packets == "" {
+			state.Fragmentation = model.DefaultFragmentationConfig()
+		}
+		if state.Mux.Concurrency == 0 {
+			state.Mux = model.DefaultMuxConfig()
+		}
+		if state.Advanced.ResolveServerIP == "" {
+			state.Advanced = model.DefaultAdvancedTunnelConfig()
+		}
+	}
+
+	if engine != nil && state != nil {
+		engine.SetTunnelOptions(state.IPType, state.Fragmentation, state.Mux, state.Advanced)
+	}
+
 	m := &Model{
 		view:              ViewMain,
 		width:             100,
@@ -138,6 +184,8 @@ func NewModel(state *model.AppState, procMgr *process.ProcessManager, engine *co
 		fetcher:           subscription.NewFetcher(state.UserAgent),
 		textInput:         ti,
 		customUATextInput: uaInput,
+		advTextInput:      advInput,
+		fragTextInput:     fragInput,
 		selectedNodeIdx:   0,
 		nodeScrollOffset:  0,
 		collapsedSubs:     make(map[string]bool),
@@ -329,7 +377,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusIsError = false
 			m.geoSyncMsg = "Databases up to date"
 			if m.state.IsConnected && m.engine != nil {
-				_ = m.engine.UpdateGeoRules(m.state.GeoRules)
+				rulesToUse := model.ResolveGeoRules(m.state.ActiveNode, m.state.Subscriptions, m.state.GeoRules)
+				_ = m.engine.UpdateGeoRules(rulesToUse)
 			}
 		}
 		return m, nil
@@ -561,6 +610,73 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if m.advInputActive {
+		switch key {
+		case "esc":
+			m.advInputActive = false
+			m.advTextInput.Reset()
+			return m, nil
+		case "enter":
+			val := strings.TrimSpace(m.advTextInput.Value())
+			m.advInputActive = false
+			m.advTextInput.Reset()
+			if val != "" {
+				if m.advCursor == 3 {
+					m.state.Advanced.ResolveServerIP = val
+					m.statusMessage = fmt.Sprintf("Resolve Server IP set: %s", val)
+				} else if m.advCursor == 4 {
+					m.state.Advanced.ResolveServerDomain = val
+					m.statusMessage = fmt.Sprintf("Resolve Server Domain set: %s", val)
+				}
+				m.statusIsError = false
+				_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+				if m.state.IsConnected && m.engine != nil {
+					_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+				}
+			}
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.advTextInput, cmd = m.advTextInput.Update(msg)
+			return m, cmd
+		}
+	}
+
+	if m.fragInputActive {
+		switch key {
+		case "esc":
+			m.fragInputActive = false
+			m.fragTextInput.Reset()
+			return m, nil
+		case "enter":
+			val := strings.TrimSpace(m.fragTextInput.Value())
+			m.fragInputActive = false
+			m.fragTextInput.Reset()
+			if val != "" {
+				if m.fragCursor == 1 {
+					m.state.Fragmentation.Packets = val
+					m.statusMessage = fmt.Sprintf("Fragmentation Packets set: %s", val)
+				} else if m.fragCursor == 2 {
+					m.state.Fragmentation.Length = val
+					m.statusMessage = fmt.Sprintf("Fragmentation Length set: %s", val)
+				} else if m.fragCursor == 3 {
+					m.state.Fragmentation.Interval = val
+					m.statusMessage = fmt.Sprintf("Fragmentation Interval set: %s", val)
+				}
+				m.statusIsError = false
+				_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+				if m.state.IsConnected && m.engine != nil {
+					_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+				}
+			}
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.fragTextInput, cmd = m.fragTextInput.Update(msg)
+			return m, cmd
+		}
+	}
+
 	if m.addInputActive {
 		switch key {
 		case "esc":
@@ -600,7 +716,7 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						if groupName == "" {
 							groupName = "Local Config"
 						}
-						nodes, parseErr := subscription.ParseContent(string(fileData), groupName)
+						nodes, rules, parseErr := subscription.ParseContentWithRules(string(fileData), groupName)
 						if parseErr != nil {
 							return subFetchedMsg{err: parseErr}
 						}
@@ -609,6 +725,7 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 							Name:      groupName,
 							URL:       urlStr,
 							Nodes:     nodes,
+							GeoRules:  rules,
 							UpdatedAt: time.Now(),
 						}
 						return subFetchedMsg{sub: sub}
@@ -621,7 +738,7 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 
 					// 4. Raw JSON, YAML, or Base64 pasted directly
-					nodes, err := subscription.ParseContent(urlStr, "Custom Nodes")
+					nodes, rules, err := subscription.ParseContentWithRules(urlStr, "Custom Nodes")
 					if err != nil {
 						return subFetchedMsg{err: fmt.Errorf("invalid subscription link, path or content: %w", err)}
 					}
@@ -630,6 +747,7 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						Name:      "Custom Nodes",
 						URL:       "",
 						Nodes:     nodes,
+						GeoRules:  rules,
 						UpdatedAt: time.Now(),
 					}
 					return subFetchedMsg{sub: sub}
@@ -763,16 +881,20 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "q":
-		if m.view == ViewProc || m.view == ViewSettings || m.view == ViewTheme || m.view == ViewGeoRules || m.view == ViewLogs {
+		if m.view == ViewProc || m.view == ViewSettings || m.view == ViewTheme || m.view == ViewGeoRules || m.view == ViewLogs || m.view == ViewAdvancedSettings || m.view == ViewFragmentation || m.view == ViewMux {
 			if m.view == ViewGeoRules {
 				if m.geoInActionView {
 					m.geoInActionView = false
 					return m, nil
 				}
+				if m.geoInProfileView {
+					m.geoInProfileView = false
+					return m, nil
+				}
 				m.view = ViewSettings
 				return m, nil
 			}
-			if m.view == ViewTheme {
+			if m.view == ViewTheme || m.view == ViewAdvancedSettings || m.view == ViewFragmentation || m.view == ViewMux {
 				m.view = ViewSettings
 				return m, nil
 			}
@@ -796,6 +918,9 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "L":
+		if (m.view == ViewTheme && m.themeSliderActive) || (m.view == ViewMux && (m.muxCursor == 1 || m.muxCursor == 2)) {
+			break
+		}
 		if m.view == ViewLogs {
 			m.view = ViewMain
 		} else {
@@ -804,7 +929,7 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "`", "~":
-		if m.view == ViewSettings {
+		if m.view == ViewSettings || m.view == ViewAdvancedSettings || m.view == ViewFragmentation || m.view == ViewMux {
 			m.view = ViewMain
 		} else {
 			m.view = ViewSettings
@@ -826,6 +951,12 @@ func (m *Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleGeoKeys(key)
 	case ViewLogs:
 		return m.handleLogsKeys(key)
+	case ViewAdvancedSettings:
+		return m.handleAdvancedKeys(key)
+	case ViewFragmentation:
+		return m.handleFragKeys(key)
+	case ViewMux:
+		return m.handleMuxKeys(key)
 	}
 
 	return m, nil
@@ -938,6 +1069,122 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 		m.clampNodeState()
 		return m, nil
 
+	case "d", "D", "delete", "del":
+		if len(items) > 0 && m.selectedNodeIdx < len(items) {
+			curr := items[m.selectedNodeIdx]
+			if curr.Sub != nil {
+				if curr.IsHeader || key == "D" || key == "delete" || key == "del" {
+					targetSub := curr.Sub
+					subName := targetSub.Name
+					nodeCount := len(targetSub.Nodes)
+
+					// If connected node is from this subscription, stop VPN
+					if m.state.IsConnected && m.state.ActiveNode != nil {
+						for _, n := range targetSub.Nodes {
+							if n.ID == m.state.ActiveNode.ID || n == m.state.ActiveNode {
+								_ = m.engine.Stop()
+								m.state.IsConnected = false
+								m.state.ActiveNode = nil
+								break
+							}
+						}
+					}
+
+					// Remove from m.state.Subscriptions
+					for i, s := range m.state.Subscriptions {
+						if s == targetSub || s.ID == targetSub.ID {
+							m.state.Subscriptions = append(m.state.Subscriptions[:i], m.state.Subscriptions[i+1:]...)
+							break
+						}
+					}
+
+					// Reassign active node if needed
+					if m.state.ActiveNode != nil {
+						for _, n := range targetSub.Nodes {
+							if n.ID == m.state.ActiveNode.ID || n == m.state.ActiveNode {
+								m.state.ActiveNode = nil
+								break
+							}
+						}
+					}
+					if m.state.ActiveNode == nil && len(m.state.Subscriptions) > 0 && len(m.state.Subscriptions[0].Nodes) > 0 {
+						m.state.ActiveNode = m.state.Subscriptions[0].Nodes[0]
+					}
+
+					if m.collapsedSubs != nil {
+						delete(m.collapsedSubs, targetSub.ID)
+					}
+
+					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+					m.statusMessage = fmt.Sprintf("Deleted subscription %s (%d servers)", subName, nodeCount)
+					m.statusIsError = false
+					m.clampNodeState()
+					return m, nil
+				} else {
+					m.statusMessage = fmt.Sprintf("Tip: Press [e] to focus header, then [d] to delete %s (or [Del]/[Shift+D])", curr.Sub.Name)
+					m.statusIsError = false
+					return m, nil
+				}
+			}
+		}
+		return m, nil
+
+	case "shift+up", "ctrl+up", "K", "[", "<":
+		if len(items) > 0 && m.selectedNodeIdx < len(items) {
+			curr := items[m.selectedNodeIdx]
+			if curr.Sub != nil {
+				targetSub := curr.Sub
+				subIdx := -1
+				for i, s := range m.state.Subscriptions {
+					if s == targetSub || s.ID == targetSub.ID {
+						subIdx = i
+						break
+					}
+				}
+				if subIdx > 0 {
+					m.state.Subscriptions[subIdx], m.state.Subscriptions[subIdx-1] = m.state.Subscriptions[subIdx-1], m.state.Subscriptions[subIdx]
+					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+					m.statusMessage = fmt.Sprintf("Moved subscription [%s] up", targetSub.Name)
+					m.statusIsError = false
+					m.selectSubscriptionHeader(targetSub.ID)
+					return m, nil
+				} else if subIdx == 0 {
+					m.statusMessage = fmt.Sprintf("Subscription [%s] is already at the top", targetSub.Name)
+					m.statusIsError = false
+					return m, nil
+				}
+			}
+		}
+		return m, nil
+
+	case "shift+down", "ctrl+down", "J", "]", ">":
+		if len(items) > 0 && m.selectedNodeIdx < len(items) {
+			curr := items[m.selectedNodeIdx]
+			if curr.Sub != nil {
+				targetSub := curr.Sub
+				subIdx := -1
+				for i, s := range m.state.Subscriptions {
+					if s == targetSub || s.ID == targetSub.ID {
+						subIdx = i
+						break
+					}
+				}
+				if subIdx >= 0 && subIdx < len(m.state.Subscriptions)-1 {
+					m.state.Subscriptions[subIdx], m.state.Subscriptions[subIdx+1] = m.state.Subscriptions[subIdx+1], m.state.Subscriptions[subIdx]
+					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+					m.statusMessage = fmt.Sprintf("Moved subscription [%s] down", targetSub.Name)
+					m.statusIsError = false
+					m.selectSubscriptionHeader(targetSub.ID)
+					return m, nil
+				} else if subIdx == len(m.state.Subscriptions)-1 {
+					m.statusMessage = fmt.Sprintf("Subscription [%s] is already at the bottom", targetSub.Name)
+					m.statusIsError = false
+					return m, nil
+				}
+			}
+		}
+		return m, nil
+
 	case " ", "enter":
 		if len(items) > 0 && m.selectedNodeIdx < len(items) {
 			curr := items[m.selectedNodeIdx]
@@ -962,7 +1209,8 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 
 					return m, func() tea.Msg {
-						err := m.engine.Start(targetNode, m.procMgr.GetBypassNamesList(), m.state.GeoRules)
+						rulesToUse := model.ResolveGeoRules(targetNode, m.state.Subscriptions, m.state.GeoRules)
+						err := m.engine.Start(targetNode, m.procMgr.GetBypassNamesList(), rulesToUse)
 						return connectResultMsg{err: err}
 					}
 				}
@@ -994,7 +1242,8 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 					_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 
 					return m, func() tea.Msg {
-						err := m.engine.Start(targetNode, m.procMgr.GetBypassNamesList(), m.state.GeoRules)
+						rulesToUse := model.ResolveGeoRules(targetNode, m.state.Subscriptions, m.state.GeoRules)
+						err := m.engine.Start(targetNode, m.procMgr.GetBypassNamesList(), rulesToUse)
 						return connectResultMsg{err: err}
 					}
 				}
@@ -1033,6 +1282,9 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 					s.Download = updated.Download
 					s.Total = updated.Total
 					s.UpdatedAt = time.Now()
+					if len(updated.GeoRules) > 0 && len(s.GeoRules) == 0 {
+						s.GeoRules = updated.GeoRules
+					}
 					core.LogSub("Successfully updated subscription %s: %d nodes", s.Name, len(s.Nodes))
 					if m.state.ActiveNode != nil {
 						for _, n := range updated.Nodes {
@@ -1055,6 +1307,24 @@ func (m *Model) handleMainKeys(key string) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m *Model) selectSubscriptionHeader(subID string) {
+	items := m.getServerListItems()
+	for idx, it := range items {
+		if it.IsHeader && it.Sub != nil && it.Sub.ID == subID {
+			m.selectedNodeIdx = idx
+			vis := m.getNodeVisibleHeight()
+			if m.selectedNodeIdx < m.nodeScrollOffset {
+				m.nodeScrollOffset = m.selectedNodeIdx
+			}
+			if m.selectedNodeIdx >= m.nodeScrollOffset+vis {
+				m.nodeScrollOffset = m.selectedNodeIdx - vis + 1
+			}
+			break
+		}
+	}
+	m.clampNodeState()
 }
 
 func (m *Model) clampProcState() {
@@ -1290,6 +1560,8 @@ func (m *Model) handleSettingsKeys(key string) (tea.Model, tea.Cmd) {
 		m.view = ViewGeoRules
 		m.geoModeAdd = false
 		m.geoInActionView = false
+		m.geoInProfileView = false
+		m.geoProfileIdx = 0
 		m.geoActionIdx = 0
 		return m, nil
 
@@ -1302,47 +1574,39 @@ func (m *Model) handleSettingsKeys(key string) (tea.Model, tea.Cmd) {
 			m.settingsCursor--
 		}
 	case "down", "j":
-		if m.settingsCursor < 4 {
+		if m.settingsCursor < 8 {
 			m.settingsCursor++
 		}
 	case "e", "E":
-		if m.settingsCursor == 1 && m.settingsUAIdx == 4 {
+		if m.settingsCursor == 2 {
 			m.customUAActive = true
 			m.customUATextInput.SetValue(m.state.UserAgent)
 			m.customUATextInput.Focus()
 			return m, nil
+		} else if m.settingsCursor == 6 {
+			m.view = ViewFragmentation
+			m.fragCursor = 0
+			m.fragInputActive = false
+			return m, nil
+		} else if m.settingsCursor == 7 {
+			m.view = ViewMux
+			m.muxCursor = 0
+			return m, nil
+		} else if m.settingsCursor == 8 {
+			m.view = ViewAdvancedSettings
+			m.advCursor = 0
+			m.advInputActive = false
+			return m, nil
 		}
 	case "enter", " ":
-		if m.settingsCursor == 0 {
+		switch m.settingsCursor {
+		case 0:
 			m.view = ViewTheme
 			m.themeSliderActive = false
 			m.themeCursor = 0
 			return m, nil
-		} else if m.settingsCursor == 1 {
-			m.settingsUAIdx = (m.settingsUAIdx + 1) % 5
-			if m.settingsUAIdx == 4 {
-				m.customUAActive = true
-				m.customUATextInput.SetValue(m.state.UserAgent)
-				m.customUATextInput.Focus()
-				return m, nil
-			} else {
-				uas := []string{subscription.DefaultUserAgent, subscription.ClashUserAgent, subscription.V2RayNUserAgent, "Sing-box/1.10.0"}
-				m.state.UserAgent = uas[m.settingsUAIdx]
-				m.fetcher.UserAgent = m.state.UserAgent
-				m.statusMessage = fmt.Sprintf("User-Agent set: %s", m.state.UserAgent)
-				m.statusIsError = false
-			}
-		} else if m.settingsCursor == 2 {
-			m.settingsModeIdx = (m.settingsModeIdx + 1) % 3
-			modes := []model.TunnelMode{model.ModeTUN, model.ModeSystemProxy, model.ModeDirect}
-			m.state.Mode = modes[m.settingsModeIdx]
-		} else if m.settingsCursor == 3 {
-			m.view = ViewGeoRules
-			m.geoModeAdd = false
-			m.geoInActionView = false
-			m.geoActionIdx = 0
-			return m, nil
-		} else if m.settingsCursor == 4 {
+
+		case 1:
 			if core.IsSystemdServiceEnabled() {
 				_ = core.UninstallSystemdService()
 				m.statusMessage = "Systemd user service disabled."
@@ -1356,10 +1620,312 @@ func (m *Model) handleSettingsKeys(key string) (tea.Model, tea.Cmd) {
 					m.statusIsError = true
 				}
 			}
+
+		case 2:
+			m.settingsUAIdx = (m.settingsUAIdx + 1) % 5
+			if m.settingsUAIdx == 4 {
+				m.customUAActive = true
+				m.customUATextInput.SetValue(m.state.UserAgent)
+				m.customUATextInput.Focus()
+				return m, nil
+			} else {
+				uas := []string{subscription.DefaultUserAgent, subscription.ClashUserAgent, subscription.V2RayNUserAgent, "Sing-box/1.10.0"}
+				m.state.UserAgent = uas[m.settingsUAIdx]
+				m.fetcher.UserAgent = m.state.UserAgent
+				m.statusMessage = fmt.Sprintf("User-Agent set: %s", m.state.UserAgent)
+				m.statusIsError = false
+			}
+
+		case 3:
+			m.settingsModeIdx = (m.settingsModeIdx + 1) % 3
+			modes := []model.TunnelMode{model.ModeTUN, model.ModeSystemProxy, model.ModeDirect}
+			m.state.Mode = modes[m.settingsModeIdx]
+
+		case 4:
+			switch m.state.IPType {
+			case model.IPTypePreferIPv4:
+				m.state.IPType = model.IPTypePreferIPv6
+			case model.IPTypePreferIPv6:
+				m.state.IPType = model.IPTypeIPv4Only
+			case model.IPTypeIPv4Only:
+				m.state.IPType = model.IPTypeIPv6Only
+			default:
+				m.state.IPType = model.IPTypePreferIPv4
+			}
+			m.statusMessage = fmt.Sprintf("IP strategy set: %s", m.state.IPType)
+			m.statusIsError = false
+			if m.state.IsConnected && m.engine != nil {
+				_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+			}
+
+		case 5:
+			m.view = ViewGeoRules
+			m.geoModeAdd = false
+			m.geoInActionView = false
+			m.geoInProfileView = false
+			m.geoProfileIdx = 0
+			m.geoActionIdx = 0
+			return m, nil
+
+		case 6:
+			if key == " " {
+				m.state.Fragmentation.Enabled = !m.state.Fragmentation.Enabled
+				m.statusMessage = fmt.Sprintf("Fragmentation: enabled = %t", m.state.Fragmentation.Enabled)
+				m.statusIsError = false
+				if m.state.IsConnected && m.engine != nil {
+					_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+				}
+			} else {
+				m.view = ViewFragmentation
+				m.fragCursor = 0
+				m.fragInputActive = false
+				return m, nil
+			}
+
+		case 7:
+			if key == " " {
+				m.state.Mux.Enabled = !m.state.Mux.Enabled
+				m.statusMessage = fmt.Sprintf("Mux: enabled = %t", m.state.Mux.Enabled)
+				m.statusIsError = false
+				if m.state.IsConnected && m.engine != nil {
+					_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+				}
+			} else {
+				m.view = ViewMux
+				m.muxCursor = 0
+				return m, nil
+			}
+
+		case 8:
+			m.view = ViewAdvancedSettings
+			m.advCursor = 0
+			m.advInputActive = false
+			return m, nil
 		}
 		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 	case "esc", "q", "Q":
 		m.view = ViewMain
+	}
+	return m, nil
+}
+
+func (m *Model) handleAdvancedKeys(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "up", "k":
+		if m.advCursor > 0 {
+			m.advCursor--
+		}
+	case "down", "j":
+		if m.advCursor < 5 {
+			m.advCursor++
+		}
+	case "e", "E":
+		if m.advCursor == 3 {
+			m.advInputActive = true
+			m.advTextInput.SetValue(m.state.Advanced.ResolveServerIP)
+			m.advTextInput.Focus()
+			return m, nil
+		} else if m.advCursor == 4 {
+			m.advInputActive = true
+			m.advTextInput.SetValue(m.state.Advanced.ResolveServerDomain)
+			m.advTextInput.Focus()
+			return m, nil
+		}
+	case "enter", " ":
+		switch m.advCursor {
+		case 0:
+			m.state.Advanced.UseLocalDNS = !m.state.Advanced.UseLocalDNS
+		case 1:
+			m.state.Advanced.UseDNSFromJSON = !m.state.Advanced.UseDNSFromJSON
+		case 2:
+			m.state.Advanced.EnableResolveServer = !m.state.Advanced.EnableResolveServer
+		case 3:
+			m.advInputActive = true
+			m.advTextInput.SetValue(m.state.Advanced.ResolveServerIP)
+			m.advTextInput.Focus()
+			return m, nil
+		case 4:
+			m.advInputActive = true
+			m.advTextInput.SetValue(m.state.Advanced.ResolveServerDomain)
+			m.advTextInput.Focus()
+			return m, nil
+		case 5:
+			m.state.Advanced.EnableSniffing = !m.state.Advanced.EnableSniffing
+		}
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "esc", "q", "Q":
+		m.view = ViewSettings
+		m.settingsCursor = 8
+	}
+	return m, nil
+}
+
+func (m *Model) handleFragKeys(key string) (tea.Model, tea.Cmd) {
+	switch key {
+	case "up", "k":
+		if m.fragCursor > 0 {
+			m.fragCursor--
+		}
+	case "down", "j":
+		if m.fragCursor < 3 {
+			m.fragCursor++
+		}
+	case "e", "E":
+		switch m.fragCursor {
+		case 1:
+			m.fragInputActive = true
+			m.fragTextInput.SetValue(m.state.Fragmentation.Packets)
+			m.fragTextInput.Focus()
+			return m, nil
+		case 2:
+			m.fragInputActive = true
+			m.fragTextInput.SetValue(m.state.Fragmentation.Length)
+			m.fragTextInput.Focus()
+			return m, nil
+		case 3:
+			m.fragInputActive = true
+			m.fragTextInput.SetValue(m.state.Fragmentation.Interval)
+			m.fragTextInput.Focus()
+			return m, nil
+		}
+	case "enter", " ":
+		switch m.fragCursor {
+		case 0:
+			m.state.Fragmentation.Enabled = !m.state.Fragmentation.Enabled
+		case 1:
+			switch m.state.Fragmentation.Packets {
+			case "tlshello":
+				m.state.Fragmentation.Packets = "1-3"
+			case "1-3":
+				m.state.Fragmentation.Packets = "1-5"
+			default:
+				m.state.Fragmentation.Packets = "tlshello"
+			}
+		case 2:
+			switch m.state.Fragmentation.Length {
+			case "100-200":
+				m.state.Fragmentation.Length = "50-100"
+			case "50-100":
+				m.state.Fragmentation.Length = "10-30"
+			default:
+				m.state.Fragmentation.Length = "100-200"
+			}
+		case 3:
+			switch m.state.Fragmentation.Interval {
+			case "10-20":
+				m.state.Fragmentation.Interval = "5-10"
+			case "5-10":
+				m.state.Fragmentation.Interval = "1-5"
+			default:
+				m.state.Fragmentation.Interval = "10-20"
+			}
+		}
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "r", "R":
+		m.state.Fragmentation = model.DefaultFragmentationConfig()
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "esc", "q", "Q":
+		m.view = ViewSettings
+		m.settingsCursor = 6
+	}
+	return m, nil
+}
+
+func (m *Model) handleMuxKeys(key string) (tea.Model, tea.Cmd) {
+	clamp := func(val, min, max int) int {
+		if val < min {
+			return min
+		}
+		if val > max {
+			return max
+		}
+		return val
+	}
+
+	switch key {
+	case "up", "k":
+		if m.muxCursor > 0 {
+			m.muxCursor--
+		}
+	case "down", "j":
+		if m.muxCursor < 3 {
+			m.muxCursor++
+		}
+	case "left", "h":
+		if m.muxCursor == 1 {
+			m.state.Mux.Concurrency = clamp(m.state.Mux.Concurrency-1, 1, 128)
+		} else if m.muxCursor == 2 {
+			m.state.Mux.XUDPConcurrency = clamp(m.state.Mux.XUDPConcurrency-1, 1, 128)
+		}
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "right", "l":
+		if m.muxCursor == 1 {
+			m.state.Mux.Concurrency = clamp(m.state.Mux.Concurrency+1, 1, 128)
+		} else if m.muxCursor == 2 {
+			m.state.Mux.XUDPConcurrency = clamp(m.state.Mux.XUDPConcurrency+1, 1, 128)
+		}
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "H", "shift+left", "[":
+		if m.muxCursor == 1 {
+			m.state.Mux.Concurrency = clamp(m.state.Mux.Concurrency-8, 1, 128)
+		} else if m.muxCursor == 2 {
+			m.state.Mux.XUDPConcurrency = clamp(m.state.Mux.XUDPConcurrency-8, 1, 128)
+		}
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "L", "shift+right", "]":
+		if m.muxCursor == 1 {
+			m.state.Mux.Concurrency = clamp(m.state.Mux.Concurrency+8, 1, 128)
+		} else if m.muxCursor == 2 {
+			m.state.Mux.XUDPConcurrency = clamp(m.state.Mux.XUDPConcurrency+8, 1, 128)
+		}
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "enter", " ":
+		if m.muxCursor == 0 {
+			m.state.Mux.Enabled = !m.state.Mux.Enabled
+		} else if m.muxCursor == 3 {
+			switch m.state.Mux.XUDPProxyUDP443 {
+			case "reject":
+				m.state.Mux.XUDPProxyUDP443 = "allow"
+			case "allow":
+				m.state.Mux.XUDPProxyUDP443 = "skip"
+			default:
+				m.state.Mux.XUDPProxyUDP443 = "reject"
+			}
+		}
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "r", "R":
+		m.state.Mux = model.DefaultMuxConfig()
+		_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+		if m.state.IsConnected && m.engine != nil {
+			_ = m.engine.UpdateTunnelConfig(m.state.IPType, m.state.Fragmentation, m.state.Mux, m.state.Advanced)
+		}
+	case "esc", "q", "Q":
+		m.view = ViewSettings
+		m.settingsCursor = 7
 	}
 	return m, nil
 }
@@ -1436,8 +2002,9 @@ func (m *Model) handleGeoPickerKeys(key string) (tea.Model, tea.Cmd) {
 				ruleType = model.GeoTypeIP
 			}
 
+			rules := m.getActiveProfileRules()
 			found := false
-			for _, r := range m.state.GeoRules {
+			for _, r := range rules {
 				if r.Type == ruleType && strings.EqualFold(r.Name, selectedName) {
 					if r.Action == m.geoActionSelect {
 						switch r.Action {
@@ -1451,7 +2018,7 @@ func (m *Model) handleGeoPickerKeys(key string) (tea.Model, tea.Cmd) {
 					} else {
 						r.Action = m.geoActionSelect
 					}
-					m.statusMessage = fmt.Sprintf("Updated rule %s [%s]", selectedName, strings.ToUpper(string(r.Action)))
+					m.statusMessage = fmt.Sprintf("Updated rule %s [%s] in %s", selectedName, strings.ToUpper(string(r.Action)), m.getActiveProfileName())
 					found = true
 					break
 				}
@@ -1462,9 +2029,10 @@ func (m *Model) handleGeoPickerKeys(key string) (tea.Model, tea.Cmd) {
 					Name:   selectedName,
 					Action: m.geoActionSelect,
 				}
-				m.state.GeoRules = append(m.state.GeoRules, newRule)
-				m.geoCursor = len(m.state.GeoRules) - 1
-				m.statusMessage = fmt.Sprintf("Added rule %s [%s]", selectedName, strings.ToUpper(string(m.geoActionSelect)))
+				rules = append(rules, newRule)
+				m.setActiveProfileRules(rules)
+				m.geoCursor = len(rules) - 1
+				m.statusMessage = fmt.Sprintf("Added rule %s [%s] to %s", selectedName, strings.ToUpper(string(m.geoActionSelect)), m.getActiveProfileName())
 			}
 
 			// Keep m.geoModeAdd = true and preserve m.geoSearchQuery!
@@ -1472,7 +2040,8 @@ func (m *Model) handleGeoPickerKeys(key string) (tea.Model, tea.Cmd) {
 			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 
 			if m.state.IsConnected && m.engine != nil {
-				if err := m.engine.UpdateGeoRules(m.state.GeoRules); err != nil {
+				rulesToUse := model.ResolveGeoRules(m.state.ActiveNode, m.state.Subscriptions, m.state.GeoRules)
+				if err := m.engine.UpdateGeoRules(rulesToUse); err != nil {
 					m.statusMessage = fmt.Sprintf("Geo Rule Apply Error: %v", err)
 					m.statusIsError = true
 				}
@@ -1501,10 +2070,151 @@ func (m *Model) handleGeoPickerKeys(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleGeoKeys(key string) (tea.Model, tea.Cmd) {
+	if m.geoModeAdd {
+		return m.handleGeoPickerKeys(key)
+	}
 	if m.geoInActionView {
 		return m.handleGeoActionViewKeys(key)
 	}
-	return m.handleGeoMenuKeys(key)
+	if m.geoInProfileView {
+		return m.handleGeoMenuKeys(key)
+	}
+	return m.handleGeoProfileKeys(key)
+}
+
+func (m *Model) handleGeoProfileKeys(key string) (tea.Model, tea.Cmd) {
+	totalProfiles := len(m.state.Subscriptions) + 1
+	switch key {
+	case "up", "k":
+		if m.geoProfileIdx > 0 {
+			m.geoProfileIdx--
+		} else {
+			m.geoProfileIdx = totalProfiles - 1
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.geoProfileIdx < totalProfiles-1 {
+			m.geoProfileIdx++
+		} else {
+			m.geoProfileIdx = 0
+		}
+		return m, nil
+
+	case "0":
+		m.geoProfileIdx = 0
+		m.geoInProfileView = true
+		m.geoActionIdx = 0
+		return m, nil
+
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		idx := int(key[0] - '0')
+		if idx < totalProfiles {
+			m.geoProfileIdx = idx
+			m.geoInProfileView = true
+			m.geoActionIdx = 0
+		}
+		return m, nil
+
+	case "enter", " ":
+		m.geoInProfileView = true
+		m.geoActionIdx = 0
+		return m, nil
+
+	case "u", "U":
+		m.geoSyncing = true
+		m.geoSyncMsg = "Downloading GeoSite/GeoIP DBs from GitHub..."
+		m.statusMessage = "Downloading GeoSite and GeoIP databases..."
+		m.statusIsError = false
+		return m, m.syncGeoDatabasesCmd()
+
+	case "shift+up", "ctrl+up", "K", "[", "<":
+		if m.geoProfileIdx > 1 {
+			subIdx := m.geoProfileIdx - 1
+			m.state.Subscriptions[subIdx], m.state.Subscriptions[subIdx-1] = m.state.Subscriptions[subIdx-1], m.state.Subscriptions[subIdx]
+			m.geoProfileIdx--
+			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+			m.statusMessage = fmt.Sprintf("Moved subscription [%s] up", m.state.Subscriptions[m.geoProfileIdx-1].Name)
+			m.statusIsError = false
+		}
+		return m, nil
+
+	case "shift+down", "ctrl+down", "J", "]", ">":
+		if m.geoProfileIdx > 0 && m.geoProfileIdx < len(m.state.Subscriptions) {
+			subIdx := m.geoProfileIdx - 1
+			m.state.Subscriptions[subIdx], m.state.Subscriptions[subIdx+1] = m.state.Subscriptions[subIdx+1], m.state.Subscriptions[subIdx]
+			m.geoProfileIdx++
+			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+			m.statusMessage = fmt.Sprintf("Moved subscription [%s] down", m.state.Subscriptions[m.geoProfileIdx-1].Name)
+			m.statusIsError = false
+		}
+		return m, nil
+
+	case "d", "D", "delete", "del":
+		if m.geoProfileIdx > 0 && m.geoProfileIdx <= len(m.state.Subscriptions) {
+			sub := m.state.Subscriptions[m.geoProfileIdx-1]
+			if len(sub.GeoRules) > 0 {
+				sub.GeoRules = nil
+				_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+				if m.state.IsConnected && m.engine != nil {
+					rulesToUse := model.ResolveGeoRules(m.state.ActiveNode, m.state.Subscriptions, m.state.GeoRules)
+					_ = m.engine.UpdateGeoRules(rulesToUse)
+				}
+				m.statusMessage = fmt.Sprintf("Cleared custom rules for [%s] (now inherits Global)", sub.Name)
+				m.statusIsError = false
+				return m, nil
+			} else {
+				// Delete empty subscription
+				targetSub := sub
+				subName := targetSub.Name
+				nodeCount := len(targetSub.Nodes)
+
+				if m.state.IsConnected && m.state.ActiveNode != nil {
+					for _, n := range targetSub.Nodes {
+						if n.ID == m.state.ActiveNode.ID || n == m.state.ActiveNode {
+							_ = m.engine.Stop()
+							m.state.IsConnected = false
+							m.state.ActiveNode = nil
+							break
+						}
+					}
+				}
+
+				subIdx := m.geoProfileIdx - 1
+				m.state.Subscriptions = append(m.state.Subscriptions[:subIdx], m.state.Subscriptions[subIdx+1:]...)
+				if m.geoProfileIdx > len(m.state.Subscriptions) {
+					m.geoProfileIdx = len(m.state.Subscriptions)
+				}
+
+				if m.state.ActiveNode != nil {
+					for _, n := range targetSub.Nodes {
+						if n.ID == m.state.ActiveNode.ID || n == m.state.ActiveNode {
+							m.state.ActiveNode = nil
+							break
+						}
+					}
+				}
+				if m.state.ActiveNode == nil && len(m.state.Subscriptions) > 0 && len(m.state.Subscriptions[0].Nodes) > 0 {
+					m.state.ActiveNode = m.state.Subscriptions[0].Nodes[0]
+				}
+
+				if m.collapsedSubs != nil {
+					delete(m.collapsedSubs, targetSub.ID)
+				}
+
+				_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
+				m.statusMessage = fmt.Sprintf("Deleted subscription %s (%d servers)", subName, nodeCount)
+				m.statusIsError = false
+				return m, nil
+			}
+		}
+		return m, nil
+
+	case "esc", "q", "Q":
+		m.view = ViewSettings
+		return m, nil
+	}
+	return m, nil
 }
 
 func (m *Model) handleGeoMenuKeys(key string) (tea.Model, tea.Cmd) {
@@ -1560,7 +2270,7 @@ func (m *Model) handleGeoMenuKeys(key string) (tea.Model, tea.Cmd) {
 		return m, m.syncGeoDatabasesCmd()
 
 	case "esc", "q", "Q":
-		m.view = ViewSettings
+		m.geoInProfileView = false
 		return m, nil
 	}
 	return m, nil
@@ -1578,16 +2288,19 @@ func (m *Model) handleGeoActionViewKeys(key string) (tea.Model, tea.Cmd) {
 	case "tab":
 		m.geoTab = 1 - m.geoTab
 		m.geoRuleCursor = 0
+		m.geoRuleScroll = 0
 		return m, nil
 
 	case "1":
 		m.geoTab = 0
 		m.geoRuleCursor = 0
+		m.geoRuleScroll = 0
 		return m, nil
 
 	case "2":
 		m.geoTab = 1
 		m.geoRuleCursor = 0
+		m.geoRuleScroll = 0
 		return m, nil
 
 	case "a", "A":
@@ -1612,6 +2325,33 @@ func (m *Model) handleGeoActionViewKeys(key string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "pgup", "pageup":
+		m.geoRuleCursor -= 10
+		if m.geoRuleCursor < 0 {
+			m.geoRuleCursor = 0
+		}
+		return m, nil
+
+	case "pgdown", "pagedown":
+		m.geoRuleCursor += 10
+		if m.geoRuleCursor >= len(rules) {
+			m.geoRuleCursor = len(rules) - 1
+		}
+		if m.geoRuleCursor < 0 {
+			m.geoRuleCursor = 0
+		}
+		return m, nil
+
+	case "home":
+		m.geoRuleCursor = 0
+		return m, nil
+
+	case "end":
+		if len(rules) > 0 {
+			m.geoRuleCursor = len(rules) - 1
+		}
+		return m, nil
+
 	case " ":
 		// Move action of current rule (Direct -> Proxy -> Block -> Direct)
 		if len(rules) > 0 && m.geoRuleCursor >= 0 && m.geoRuleCursor < len(rules) {
@@ -1626,7 +2366,8 @@ func (m *Model) handleGeoActionViewKeys(key string) (tea.Model, tea.Cmd) {
 			}
 			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 			if m.state.IsConnected && m.engine != nil {
-				_ = m.engine.UpdateGeoRules(m.state.GeoRules)
+				rulesToUse := model.ResolveGeoRules(m.state.ActiveNode, m.state.Subscriptions, m.state.GeoRules)
+				_ = m.engine.UpdateGeoRules(rulesToUse)
 			}
 			m.statusMessage = fmt.Sprintf("Moved rule %s to %s", r.Name, strings.ToUpper(string(r.Action)))
 			m.statusIsError = false
@@ -1649,7 +2390,8 @@ func (m *Model) handleGeoActionViewKeys(key string) (tea.Model, tea.Cmd) {
 			m.statusIsError = false
 			_ = core.SaveConfig(m.state, m.procMgr.BypassNames)
 			if m.state.IsConnected && m.engine != nil {
-				_ = m.engine.UpdateGeoRules(m.state.GeoRules)
+				rulesToUse := model.ResolveGeoRules(m.state.ActiveNode, m.state.Subscriptions, m.state.GeoRules)
+				_ = m.engine.UpdateGeoRules(rulesToUse)
 			}
 		}
 		return m, nil
@@ -1796,6 +2538,12 @@ func (m *Model) View() string {
 		body = m.RenderGeoView()
 	case ViewLogs:
 		body = m.RenderLogsView()
+	case ViewAdvancedSettings:
+		body = m.RenderAdvancedSettingsView()
+	case ViewFragmentation:
+		body = m.RenderFragView()
+	case ViewMux:
+		body = m.RenderMuxView()
 	}
 
 	header := m.renderTopBar()
@@ -2147,6 +2895,33 @@ func (m *Model) renderFooter() string {
 			RenderFooterButton("r", "refresh"),
 			RenderFooterButton("c", "clear"),
 			RenderFooterButton("q/esc", "back"),
+		}, "")
+
+	case ViewAdvancedSettings:
+		buttons = strings.Join([]string{
+			RenderFooterButton("↑/↓", "select"),
+			RenderFooterButton("↵/space", "toggle/edit"),
+			RenderFooterButton("e", "edit text"),
+			RenderFooterButton("q/esc", "back to settings"),
+		}, "")
+
+	case ViewFragmentation:
+		buttons = strings.Join([]string{
+			RenderFooterButton("↑/↓", "select"),
+			RenderFooterButton("↵/space", "toggle/cycle"),
+			RenderFooterButton("e", "custom input"),
+			RenderFooterButton("r", "defaults"),
+			RenderFooterButton("q/esc", "save & back"),
+		}, "")
+
+	case ViewMux:
+		buttons = strings.Join([]string{
+			RenderFooterButton("↑/↓", "select"),
+			RenderFooterButton("←/→", "±1"),
+			RenderFooterButton("H/L", "±8"),
+			RenderFooterButton("↵/space", "toggle/cycle"),
+			RenderFooterButton("r", "defaults"),
+			RenderFooterButton("q/esc", "save & back"),
 		}, "")
 	}
 

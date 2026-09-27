@@ -277,14 +277,20 @@ func TestMainViewRenderingExactDimensions(t *testing.T) {
 }
 
 func TestAllViewsSolidBackgroundAndDimensions(t *testing.T) {
-	views := []ViewType{ViewMain, ViewProc, ViewSettings, ViewTheme, ViewGeoRules, ViewLogs}
+	views := []ViewType{
+		ViewMain, ViewProc, ViewSettings, ViewTheme, ViewGeoRules, ViewLogs,
+		ViewAdvancedSettings, ViewFragmentation, ViewMux,
+	}
 	viewNames := map[ViewType]string{
-		ViewMain:     "ViewMain",
-		ViewProc:     "ViewProc",
-		ViewSettings: "ViewSettings",
-		ViewTheme:    "ViewTheme",
-		ViewGeoRules: "ViewGeoRules",
-		ViewLogs:     "ViewLogs",
+		ViewMain:             "ViewMain",
+		ViewProc:             "ViewProc",
+		ViewSettings:         "ViewSettings",
+		ViewTheme:            "ViewTheme",
+		ViewGeoRules:         "ViewGeoRules",
+		ViewLogs:             "ViewLogs",
+		ViewAdvancedSettings: "ViewAdvancedSettings",
+		ViewFragmentation:    "ViewFragmentation",
+		ViewMux:              "ViewMux",
 	}
 
 	for _, v := range views {
@@ -390,15 +396,21 @@ func TestAllViewsSolidBackgroundAndDimensions(t *testing.T) {
 func TestGeoRulesNavigationAndActions(t *testing.T) {
 	m := createTestModel()
 	m.view = ViewSettings
-	m.settingsCursor = 3
+	m.settingsCursor = 5
 
-	// Press "enter" to open Geo Rules -> starts at Level 1 Menu
+	// Press "enter" to open Geo Rules -> starts at Level 0 Profile Menu
 	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.view != ViewGeoRules {
 		t.Fatalf("expected ViewGeoRules, got %v", m.view)
 	}
-	if m.geoInActionView {
-		t.Fatalf("expected to start in Level 1 menu, not action view")
+	if m.geoInProfileView || m.geoInActionView {
+		t.Fatalf("expected to start in Level 0 Profile menu")
+	}
+
+	// Press "enter" on Global Profile -> enters Level 1 Menu
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.geoInProfileView || m.geoInActionView {
+		t.Fatalf("expected to enter Level 1 Action menu")
 	}
 
 	// Press "enter" to enter Level 2: DIRECT Action View (geoActionIdx 0)
@@ -506,22 +518,31 @@ func TestGeoRulesNavigationAndActions(t *testing.T) {
 		t.Fatalf("expected geoInActionView true and geoActionIdx 1")
 	}
 
-	// Delete rule
-	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	// Delete rule using DEL key
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDelete})
 	if len(m.state.GeoRules) != 0 {
 		t.Fatalf("expected 0 geo rules after delete, got %d", len(m.state.GeoRules))
 	}
 
-	// Press "q" to return to Level 1 Menu
+	// Press "q" to return from Level 2 Action View to Level 1 Menu
 	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	if m.geoInActionView {
-		t.Fatalf("expected geoInActionView false")
+	if m.geoInActionView || !m.geoInProfileView {
+		t.Fatalf("expected geoInActionView false and geoInProfileView true")
 	}
 
-	// Press "q" on Level 1 Menu to return to ViewSettings
+	// Press "q" on Level 1 Menu to return to Level 0 Profile Menu
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if m.geoInProfileView {
+		t.Fatalf("expected geoInProfileView false after 'q' on Level 1")
+	}
+	if m.view != ViewGeoRules {
+		t.Fatalf("expected ViewGeoRules, got %v", m.view)
+	}
+
+	// Press "q" on Level 0 Profile Menu to return to ViewSettings
 	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	if m.view != ViewSettings {
-		t.Fatalf("expected ViewSettings after 'q' on menu, got %v", m.view)
+		t.Fatalf("expected ViewSettings after 'q' on profile menu, got %v", m.view)
 	}
 }
 
@@ -985,3 +1006,518 @@ func TestLogsViewTabCyclingAndNavigation(t *testing.T) {
 		t.Fatalf("expected view to be ViewMain after 'q', got %v", m.view)
 	}
 }
+
+func TestSubscriptionProfileGeoRules(t *testing.T) {
+	m := createTestModel()
+
+	// Setup: Global has 1 rule (steam -> DIRECT)
+	m.state.GeoRules = []*model.GeoRule{
+		{Type: model.GeoTypeSite, Name: "steam", Action: model.GeoActionDirect},
+	}
+
+	// Setup: Subscription 1 has custom rules (youtube -> PROXY, ru -> DIRECT)
+	subNode1 := &model.ProxyNode{ID: "sub1-node1", Name: "Sub1 Server", Address: "1.1.1.1", Port: 443}
+	sub1 := &model.Subscription{
+		ID:   "sub1",
+		Name: "Panda VPN",
+		Nodes: []*model.ProxyNode{subNode1},
+		GeoRules: []*model.GeoRule{
+			{Type: model.GeoTypeSite, Name: "youtube", Action: model.GeoActionProxy},
+			{Type: model.GeoTypeSite, Name: "ru", Action: model.GeoActionDirect},
+		},
+	}
+
+	// Setup: Subscription 2 has NO custom rules (empty)
+	subNode2 := &model.ProxyNode{ID: "sub2-node1", Name: "EmptySub Server", Address: "2.2.2.2", Port: 443}
+	sub2 := &model.Subscription{
+		ID:    "sub2",
+		Name:  "EmptySub",
+		Nodes: []*model.ProxyNode{subNode2},
+	}
+
+	m.state.Subscriptions = []*model.Subscription{sub1, sub2}
+
+	// 1. Verify model.ResolveGeoRules behavior:
+	// - Node from sub1 uses sub1's rules
+	rulesForSub1 := model.ResolveGeoRules(subNode1, m.state.Subscriptions, m.state.GeoRules)
+	if len(rulesForSub1) != 2 {
+		t.Fatalf("expected 2 rules for subNode1, got %d", len(rulesForSub1))
+	}
+	if rulesForSub1[0].Name != "youtube" {
+		t.Fatalf("expected youtube rule, got %s", rulesForSub1[0].Name)
+	}
+
+	// - Node from sub2 (empty rules) falls back to global rules
+	rulesForSub2 := model.ResolveGeoRules(subNode2, m.state.Subscriptions, m.state.GeoRules)
+	if len(rulesForSub2) != 1 || rulesForSub2[0].Name != "steam" {
+		t.Fatalf("expected fallback to global steam rule for subNode2, got %v", rulesForSub2)
+	}
+
+	// 2. Open Geo Rules UI -> starts in Level 0
+	m.view = ViewGeoRules
+	m.geoInProfileView = false
+	m.geoInActionView = false
+	m.geoProfileIdx = 0
+
+	// Level 0: Cursor moves down to select [1] Panda VPN
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.geoProfileIdx != 1 {
+		t.Fatalf("expected geoProfileIdx to be 1 (Panda VPN), got %d", m.geoProfileIdx)
+	}
+	if m.getActiveProfileName() != "Panda VPN" {
+		t.Fatalf("expected active profile 'Panda VPN', got %q", m.getActiveProfileName())
+	}
+
+	// Press Enter to enter Level 1 (Action Menu) for Panda VPN
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.geoInProfileView || m.geoInActionView {
+		t.Fatalf("expected Level 1 Action Menu for Panda VPN")
+	}
+
+	// Enter DIRECT group (key '1') -> enters Level 2 Action View
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	if !m.geoInActionView || m.geoActionIdx != 0 {
+		t.Fatalf("expected Level 2 Action View for DIRECT")
+	}
+
+	// Verify the rules displayed are from sub1 (ru rule), not global (steam)
+	activeRules := m.getActiveProfileRules()
+	if len(activeRules) != 2 {
+		t.Fatalf("expected 2 rules in sub1, got %d", len(activeRules))
+	}
+
+	// Delete 'ru' rule from Panda VPN using DEL key
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDelete})
+	if len(sub1.GeoRules) != 1 {
+		t.Fatalf("expected 1 rule in sub1 after deletion, got %d", len(sub1.GeoRules))
+	}
+	// Verify Global rules were not touched!
+	if len(m.state.GeoRules) != 1 || m.state.GeoRules[0].Name != "steam" {
+		t.Fatalf("global rules were unexpectedly modified: %v", m.state.GeoRules)
+	}
+
+	// Press 'q' to go back to Level 1
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if m.geoInActionView || !m.geoInProfileView {
+		t.Fatalf("expected back in Level 1")
+	}
+
+	// Press 'q' to go back to Level 0
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if m.geoInProfileView {
+		t.Fatalf("expected back in Level 0")
+	}
+
+	// Render Level 0 and verify solid black background
+	viewOutput := m.RenderGeoView()
+	if !strings.Contains(viewOutput, "Panda VPN") {
+		t.Fatalf("expected viewOutput to contain 'Panda VPN'")
+	}
+	if !strings.Contains(viewOutput, "Global / Default Rules") {
+		t.Fatalf("expected viewOutput to contain 'Global / Default Rules'")
+	}
+}
+
+func TestSubscriptionMoveAndDeletion(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewMain
+
+	// Setup: 3 subscriptions
+	sub1Node := &model.ProxyNode{ID: "sub1-n1", Name: "Node 1", Address: "1.1.1.1", Port: 443}
+	sub1 := &model.Subscription{ID: "sub1", Name: "Alpha Sub", Nodes: []*model.ProxyNode{sub1Node}}
+
+	sub2Node := &model.ProxyNode{ID: "sub2-n1", Name: "Node 2", Address: "2.2.2.2", Port: 443}
+	sub2 := &model.Subscription{ID: "sub2", Name: "Beta Sub", Nodes: []*model.ProxyNode{sub2Node}}
+
+	sub3Node := &model.ProxyNode{ID: "sub3-n1", Name: "Node 3", Address: "3.3.3.3", Port: 443}
+	sub3 := &model.Subscription{ID: "sub3", Name: "Gamma Sub", Nodes: []*model.ProxyNode{sub3Node}}
+
+	m.state.Subscriptions = []*model.Subscription{sub1, sub2, sub3}
+	m.state.ActiveNode = sub2Node
+	m.state.IsConnected = true
+	m.clampNodeState()
+
+	// Initial list:
+	// row 0: Header Alpha Sub
+	// row 1: Node 1
+	// row 2: Header Beta Sub
+	// row 3: Node 2
+	// row 4: Header Gamma Sub
+	// row 5: Node 3
+
+	// Select Header Beta Sub (row 2)
+	m.selectedNodeIdx = 2
+
+	// 1. Move Beta Sub UP using key 'K' (Shift+k)
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'K'}})
+	if m.state.Subscriptions[0].Name != "Beta Sub" || m.state.Subscriptions[1].Name != "Alpha Sub" {
+		t.Fatalf("expected Beta Sub to move up to index 0, got %s, %s",
+			m.state.Subscriptions[0].Name, m.state.Subscriptions[1].Name)
+	}
+
+	// 2. Move Beta Sub DOWN using key 'J' (Shift+j)
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'J'}})
+	if m.state.Subscriptions[0].Name != "Alpha Sub" || m.state.Subscriptions[1].Name != "Beta Sub" {
+		t.Fatalf("expected Beta Sub to move down back to index 1, got %s, %s",
+			m.state.Subscriptions[0].Name, m.state.Subscriptions[1].Name)
+	}
+
+	// 3. Move Beta Sub DOWN again using Cyrillic 'О' ('J')
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'О'}})
+	if m.state.Subscriptions[2].Name != "Beta Sub" {
+		t.Fatalf("expected Beta Sub to move to index 2 with Cyrillic 'О', got %s",
+			m.state.Subscriptions[2].Name)
+	}
+
+	// 4. Test deleting Beta Sub using key 'd' on header
+	// Since ActiveNode was sub2Node (from Beta Sub) and connected, it should disconnect
+	m.selectSubscriptionHeader("sub2")
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+
+	if len(m.state.Subscriptions) != 2 {
+		t.Fatalf("expected 2 subscriptions remaining, got %d", len(m.state.Subscriptions))
+	}
+	if m.state.Subscriptions[0].Name != "Alpha Sub" || m.state.Subscriptions[1].Name != "Gamma Sub" {
+		t.Fatalf("unexpected subscriptions after deletion: %s, %s",
+			m.state.Subscriptions[0].Name, m.state.Subscriptions[1].Name)
+	}
+	if m.state.IsConnected {
+		t.Fatalf("expected VPN to be disconnected when active subscription is deleted")
+	}
+
+	// 5. Test safe tip when pressing lowercase 'd' on a node (row 1 is Node 1)
+	m.selectedNodeIdx = 1
+	items := m.getServerListItems()
+	if items[1].IsHeader {
+		t.Fatalf("expected row 1 to be a node")
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	// Should NOT delete Alpha Sub on casual 'd' on a node
+	if len(m.state.Subscriptions) != 2 {
+		t.Fatalf("casual 'd' on a node should not delete subscription, got %d", len(m.state.Subscriptions))
+	}
+	if !strings.Contains(m.statusMessage, "Tip:") {
+		t.Fatalf("expected status tip, got %q", m.statusMessage)
+	}
+
+	// 6. Test Shift+D on a node DOES delete the subscription
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'D'}})
+	if len(m.state.Subscriptions) != 1 || m.state.Subscriptions[0].Name != "Gamma Sub" {
+		t.Fatalf("expected Shift+D on node to delete Alpha Sub, remaining: %d", len(m.state.Subscriptions))
+	}
+}
+
+func TestSettingsScreenSectionsRendering(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewSettings
+
+	rendered := m.RenderSettingsView()
+	if !strings.Contains(rendered, "[1] APP SETTINGS") {
+		t.Errorf("expected rendered settings to contain '[1] APP SETTINGS'")
+	}
+	if !strings.Contains(rendered, "[2] TUNNEL SETTINGS") {
+		t.Errorf("expected rendered settings to contain '[2] TUNNEL SETTINGS'")
+	}
+	if !strings.Contains(rendered, "Theme & Color Studio") {
+		t.Errorf("expected rendered settings to contain 'Theme & Color Studio'")
+	}
+	if !strings.Contains(rendered, "Preferred IP Type") {
+		t.Errorf("expected rendered settings to contain 'Preferred IP Type'")
+	}
+	if !strings.Contains(rendered, "TLS Packet Fragmentation") {
+		t.Errorf("expected rendered settings to contain 'TLS Packet Fragmentation'")
+	}
+	if !strings.Contains(rendered, "TCP/UDP Multiplexing (Mux)") {
+		t.Errorf("expected rendered settings to contain 'TCP/UDP Multiplexing (Mux)'")
+	}
+	if !strings.Contains(rendered, "Advanced Settings") {
+		t.Errorf("expected rendered settings to contain 'Advanced Settings'")
+	}
+}
+
+func TestAdvancedSettingsTogglesAndEditing(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewSettings
+	m.settingsCursor = 8
+
+	// 1. Enter ViewAdvancedSettings by pressing Enter
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.view != ViewAdvancedSettings {
+		t.Fatalf("expected ViewAdvancedSettings, got %v", m.view)
+	}
+
+	// 2. Initial state: UseLocalDNS is false -> press Enter to toggle to true
+	if m.state.Advanced.UseLocalDNS {
+		t.Fatalf("expected UseLocalDNS to be false initially")
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.state.Advanced.UseLocalDNS {
+		t.Fatalf("expected UseLocalDNS to be true after Enter")
+	}
+
+	// 3. Move to cursor 1 (UseDNSFromJSON) -> press Space to toggle
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.advCursor != 1 {
+		t.Fatalf("expected advCursor 1, got %d", m.advCursor)
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if !m.state.Advanced.UseDNSFromJSON {
+		t.Fatalf("expected UseDNSFromJSON to be true after Space")
+	}
+
+	// 4. Move to cursor 2 (EnableResolveServer) -> toggle off
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.advCursor != 2 {
+		t.Fatalf("expected advCursor 2, got %d", m.advCursor)
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Advanced.EnableResolveServer {
+		t.Fatalf("expected EnableResolveServer to be false after toggle")
+	}
+
+	// 5. Move to cursor 3 (ResolveServerIP) -> press 'e' to edit
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.advCursor != 3 {
+		t.Fatalf("expected advCursor 3, got %d", m.advCursor)
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	if !m.advInputActive {
+		t.Fatalf("expected advInputActive to be true after 'e'")
+	}
+	m.advTextInput.SetValue("1.0.0.1")
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.advInputActive {
+		t.Fatalf("expected advInputActive to be false after Enter")
+	}
+	if m.state.Advanced.ResolveServerIP != "1.0.0.1" {
+		t.Fatalf("expected ResolveServerIP '1.0.0.1', got %q", m.state.Advanced.ResolveServerIP)
+	}
+
+	// 6. Move to cursor 4 (ResolveServerDomain) -> press Enter to edit
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.advCursor != 4 {
+		t.Fatalf("expected advCursor 4, got %d", m.advCursor)
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.advInputActive {
+		t.Fatalf("expected advInputActive to be true after Enter")
+	}
+	m.advTextInput.SetValue("https://cloudflare-dns.com/dns-query")
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.state.Advanced.ResolveServerDomain != "https://cloudflare-dns.com/dns-query" {
+		t.Fatalf("expected ResolveServerDomain to be updated, got %q", m.state.Advanced.ResolveServerDomain)
+	}
+
+	// 7. Move to cursor 5 (EnableSniffing) -> toggle
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.advCursor != 5 {
+		t.Fatalf("expected advCursor 5, got %d", m.advCursor)
+	}
+	initSniff := m.state.Advanced.EnableSniffing
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Advanced.EnableSniffing == initSniff {
+		t.Fatalf("expected EnableSniffing to toggle")
+	}
+
+	// 8. Press 'q' to return to ViewSettings
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if m.view != ViewSettings {
+		t.Fatalf("expected ViewSettings after 'q', got %v", m.view)
+	}
+	if m.settingsCursor != 8 {
+		t.Fatalf("expected settingsCursor to be 8, got %d", m.settingsCursor)
+	}
+}
+
+func TestFragmentationStudioControls(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewSettings
+	m.settingsCursor = 6
+
+	// 1. Test quick Space toggle from ViewSettings
+	if m.state.Fragmentation.Enabled {
+		t.Fatalf("expected Fragmentation to be disabled initially")
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if !m.state.Fragmentation.Enabled {
+		t.Fatalf("expected Fragmentation to be enabled after Space")
+	}
+
+	// 2. Press Enter to enter ViewFragmentation
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.view != ViewFragmentation {
+		t.Fatalf("expected ViewFragmentation, got %v", m.view)
+	}
+
+	// 3. Cursor 0: Toggle with Space
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Fragmentation.Enabled {
+		t.Fatalf("expected Fragmentation to be disabled after Space inside ViewFragmentation")
+	}
+
+	// 4. Cursor 1: Cycle packets preset
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.fragCursor != 1 {
+		t.Fatalf("expected fragCursor 1, got %d", m.fragCursor)
+	}
+	// Initial packets is tlshello -> cycle to 1-3
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Fragmentation.Packets != "1-3" {
+		t.Fatalf("expected packets '1-3', got %q", m.state.Fragmentation.Packets)
+	}
+	// Cycle to 1-5
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Fragmentation.Packets != "1-5" {
+		t.Fatalf("expected packets '1-5', got %q", m.state.Fragmentation.Packets)
+	}
+
+	// 5. Cursor 2: Cycle length preset
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.fragCursor != 2 {
+		t.Fatalf("expected fragCursor 2, got %d", m.fragCursor)
+	}
+	// Initial length 100-200 -> cycle to 50-100
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Fragmentation.Length != "50-100" {
+		t.Fatalf("expected length '50-100', got %q", m.state.Fragmentation.Length)
+	}
+
+	// 6. Cursor 3: Cycle interval preset
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.fragCursor != 3 {
+		t.Fatalf("expected fragCursor 3, got %d", m.fragCursor)
+	}
+	// Initial interval 10-20 -> cycle to 5-10
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Fragmentation.Interval != "5-10" {
+		t.Fatalf("expected interval '5-10', got %q", m.state.Fragmentation.Interval)
+	}
+
+	// 7. Reset defaults with 'r'
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if m.state.Fragmentation.Packets != "tlshello" || m.state.Fragmentation.Length != "100-200" || m.state.Fragmentation.Interval != "10-20" {
+		t.Fatalf("expected default fragmentation after 'r', got %+v", m.state.Fragmentation)
+	}
+
+	// 8. Press Esc to return to ViewSettings
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.view != ViewSettings {
+		t.Fatalf("expected ViewSettings after Esc, got %v", m.view)
+	}
+}
+
+func TestMuxStudioControls(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewSettings
+	m.settingsCursor = 7
+
+	// 1. Quick Space toggle from ViewSettings
+	if m.state.Mux.Enabled {
+		t.Fatalf("expected Mux to be disabled initially")
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if !m.state.Mux.Enabled {
+		t.Fatalf("expected Mux to be enabled after Space")
+	}
+
+	// 2. Press Enter to enter ViewMux
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.view != ViewMux {
+		t.Fatalf("expected ViewMux, got %v", m.view)
+	}
+
+	// 3. Move to cursor 1 (Concurrency): test left/right and H/L
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.muxCursor != 1 {
+		t.Fatalf("expected muxCursor 1, got %d", m.muxCursor)
+	}
+	initConc := m.state.Mux.Concurrency
+	// Right (+1)
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRight})
+	if m.state.Mux.Concurrency != initConc+1 {
+		t.Fatalf("expected concurrency %d, got %d", initConc+1, m.state.Mux.Concurrency)
+	}
+	// 'L' (+8)
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'L'}})
+	if m.state.Mux.Concurrency != initConc+9 {
+		t.Fatalf("expected concurrency %d, got %d", initConc+9, m.state.Mux.Concurrency)
+	}
+
+	// 4. Move to cursor 2 (XUDP Concurrency)
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.muxCursor != 2 {
+		t.Fatalf("expected muxCursor 2, got %d", m.muxCursor)
+	}
+	initXUDP := m.state.Mux.XUDPConcurrency
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRight})
+	if m.state.Mux.XUDPConcurrency != initXUDP+1 {
+		t.Fatalf("expected xudp %d, got %d", initXUDP+1, m.state.Mux.XUDPConcurrency)
+	}
+
+	// 5. Move to cursor 3 (UDP 443 Policy): cycle reject -> allow -> skip
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyDown})
+	if m.muxCursor != 3 {
+		t.Fatalf("expected muxCursor 3, got %d", m.muxCursor)
+	}
+	if m.state.Mux.XUDPProxyUDP443 != "reject" {
+		t.Fatalf("expected default 'reject', got %q", m.state.Mux.XUDPProxyUDP443)
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Mux.XUDPProxyUDP443 != "allow" {
+		t.Fatalf("expected 'allow', got %q", m.state.Mux.XUDPProxyUDP443)
+	}
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.Mux.XUDPProxyUDP443 != "skip" {
+		t.Fatalf("expected 'skip', got %q", m.state.Mux.XUDPProxyUDP443)
+	}
+
+	// 6. Reset with 'r'
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if m.state.Mux.Concurrency != 8 || m.state.Mux.XUDPConcurrency != 16 || m.state.Mux.XUDPProxyUDP443 != "reject" {
+		t.Fatalf("expected defaults after 'r', got %+v", m.state.Mux)
+	}
+
+	// 7. Exit with 'q'
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if m.view != ViewSettings {
+		t.Fatalf("expected ViewSettings after 'q', got %v", m.view)
+	}
+}
+
+func TestIPTypePreferenceCycling(t *testing.T) {
+	m := createTestModel()
+	m.view = ViewSettings
+	m.settingsCursor = 4
+
+	// Starts at prefer_ipv4
+	if m.state.IPType != model.IPTypePreferIPv4 && m.state.IPType != "" {
+		t.Fatalf("expected initial prefer_ipv4, got %v", m.state.IPType)
+	}
+
+	// Press Enter: prefer_ipv4 -> prefer_ipv6
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.state.IPType != model.IPTypePreferIPv6 {
+		t.Fatalf("expected prefer_ipv6, got %v", m.state.IPType)
+	}
+
+	// Press Space: prefer_ipv6 -> ipv4_only
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.IPType != model.IPTypeIPv4Only {
+		t.Fatalf("expected ipv4_only, got %v", m.state.IPType)
+	}
+
+	// Press Space: ipv4_only -> ipv6_only
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.IPType != model.IPTypeIPv6Only {
+		t.Fatalf("expected ipv6_only, got %v", m.state.IPType)
+	}
+
+	// Press Space: ipv6_only -> prefer_ipv4
+	_, _ = m.handleKeyPress(tea.KeyMsg{Type: tea.KeySpace})
+	if m.state.IPType != model.IPTypePreferIPv4 {
+		t.Fatalf("expected prefer_ipv4, got %v", m.state.IPType)
+	}
+}
+
+
+
